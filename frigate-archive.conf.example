@@ -1,0 +1,75 @@
+# frigate-archive configuration
+# Installed to /etc/frigate-archive/frigate-archive.conf (override with $FRIGATE_ARCHIVE_CONF).
+# Shell-style KEY=value. Quote values containing spaces. Environment variables override this file.
+# Both the sync (bash) and frigate-archive-tool (python) read it.
+
+# --- Where things are --------------------------------------------------------
+
+# Archive root: a mounted filesystem (NFS/SMB/second disk). It must contain a marker file
+# named .frigate-archive, so an unmounted mountpoint is never filled by mistake:
+#   touch /mnt/frigate-archive/.frigate-archive
+ARCHIVE=/mnt/frigate-archive
+
+# Host path of Frigate's media directory (mounted at /media/frigate inside the container).
+# Must contain recordings/ and clips/.
+FRIGATE_MEDIA=/opt/frigate/data
+
+# How to reach Frigate's internal (unauthenticated) API on port 5000:
+#   docker:<container>        run curl inside the container (port 5000 needn't be published)
+#   http://127.0.0.1:5000     if you publish port 5000 to the host
+FRIGATE_API=docker:frigate
+
+# --- Retention and pacing ----------------------------------------------------
+
+# Days to keep footage, timelapses and thumbnails in the archive.
+KEEP_DAYS=14
+
+# Raw 10s segments newer than this are copied to the archive every run, until their hour is
+# joined. Should comfortably exceed CONSOLIDATE_AFTER_MIN + 60.
+RAW_WINDOW_MIN=120
+
+# Wait this long after an hour ends before joining it into one file.
+CONSOLIDATE_AFTER_MIN=15
+
+# Each run stops starting new hours after this long (keeps backlogs from blocking staging).
+CONSOLIDATE_BUDGET_MIN=8
+
+# Skip segments modified in the last N minutes (Frigate may still be writing them).
+SETTLE_MIN=2
+
+# rsync bandwidth cap for staging (bytes/s, rsync syntax).
+BWLIMIT=30M
+
+# --- Timelapses --------------------------------------------------------------
+
+# Cameras that get a nightly timelapse (space or comma separated). Empty = none.
+TIMELAPSE_CAMERAS=""
+
+# One frame per N seconds of footage, played at TIMELAPSE_FPS (8 s @ 30 fps: 24 h -> ~6 min).
+TIMELAPSE_INTERVAL=8
+TIMELAPSE_FPS=30
+
+# Timezone that defines "a day" for timelapses and clip times, e.g. America/New_York.
+# Empty = system timezone. install.sh also uses it to schedule the nightly timer.
+TZ=""
+
+# --- Status / alerting -------------------------------------------------------
+
+# Status JSON written every run. Alert when last_success is older than about an hour.
+STATUS_FILE=/var/lib/frigate-archive/status.json
+
+# Optional: also publish it as a retained MQTT message. Empty MQTT_HOST = off.
+MQTT_HOST=""
+MQTT_PORT=1883
+MQTT_USER=""
+MQTT_TOPIC=frigate/archive/status
+# Password: inline, or read from a file. With MQTT_PASSWORD_KEY set, the file is treated
+# as an env file and KEY=value is looked up (handy for reusing Frigate's .env).
+MQTT_PASSWORD=""
+MQTT_PASSWORD_FILE=""
+MQTT_PASSWORD_KEY=""
+
+# --- Internals ---------------------------------------------------------------
+
+LOCK_FILE=/run/frigate-archive.lock
+TMP_DIR=/var/tmp/frigate-archive

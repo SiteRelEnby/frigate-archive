@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly Frigate archive timelapse
+
+[Timer]
+# System timezone. install.sh adds a drop-in pinning this to TZ from the config when set.
+OnCalendar=*-*-* 01:30
+Persistent=true
+
+[Install]
+WantedBy=timers.target

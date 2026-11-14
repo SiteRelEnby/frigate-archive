@@ -1,0 +1,379 @@
+# frigate-archive
+
+Keep [Frigate](https://frigate.video) NVR recordings somewhere bigger than the Frigate box, and
+make them easy to review.
+
+Frigate stores recordings on its own disk, and continuous recording from a few cameras fills
+a small disk in days. frigate-archive lets you keep only a short window locally (say 12 hours)
+and moves everything to an archive filesystem (NFS, SMB, a second disk). There it becomes:
+
+- **one mp4 per camera per hour**, joined without re-encoding, with a sidecar mapping every
+  second of the file back to real time, plus Frigate's motion levels and review items
+  (alerts and detections, with thumbnails);
+- a **review page**: a day timeline per camera, motion graph, alert and detection markers,
+  seamless playback across hours at up to 16×, and an event list. It sits behind Frigate's
+  own login;
+- optional **nightly timelapses**, e.g. a workday in about 6 minutes, where clicking jumps to
+  the real footage;
+- **clips** from the command line: `frigate-clip garden "2026-10-22 14:00" 45m`.
+
+Everything runs on the Frigate host as two small scripts and a pair of systemd timers. There's
+no database and no extra service, and nothing about Frigate itself changes.
+
+---
+
+## Contents
+
+- [How it works](#how-it-works)
+- [Requirements](#requirements)
+- [Install](#install)
+- [Configuration](#configuration)
+- [Frigate settings](#frigate-settings)
+- [Review page](#review-page)
+- [Command line](#command-line)
+- [Archive layout](#archive-layout)
+- [Status and alerting](#status-and-alerting)
+- [Operations](#operations)
+- [Limitations](#limitations)
+- [License](#license)
+
+---
+
+## How it works
+
+```
+ Frigate host                                         Archive (ARCHIVE, e.g. NFS)
+ FRIGATE_MEDIA/recordings/<UTC date>/<HH>/<cam>/MM.SS.mp4     (Frigate's 10-second segments)
+        │
+        │  every 5 min: frigate-archive (systemd timer)
+        │
+        ├─ 1. rsync recent segments of hours not yet joined ──▶ recordings/…        raw staging
+        │                                                         (small exposure window)
+        ├─ 2. frigate-archive-tool consolidate ───────────────▶ hourly/<cam>/<date>/<HH>.mp4
+        │       finished hours, newest first, time-boxed;          hourly/<cam>/<date>/<HH>.json
+        │       joins from local segments (falls back to staged    thumbs/<cam>/<review-id>.webp
+        │       copies), adds motion + review items from the API   (that hour's staging is removed)
+        │
+        ├─ 3. frigate-archive-tool index ─────────────────────▶ index.json        (+ prune > KEEP_DAYS)
+        │
+        └─ 4. status ──▶ STATUS_FILE + optional retained MQTT message
+
+ nightly: frigate-timelapse (systemd timer) ──────────────────▶ timelapse/<cam>/<local date>.mp4|.json
+```
+
+Some design points:
+
+- **Each byte goes over the network about once.** Finished hours are joined from the local
+  copy and written to the archive directly. Raw segments are only staged for the most recent
+  hours, so a dead Frigate host loses minutes, not hours.
+- **Joining never re-encodes**, so it's cheap even for 4K HEVC. When a camera changes codec
+  or resolution mid-hour, the hour is split into parts (`HH.mp4`, `HH.p2.mp4`).
+- **Gaps are mapped, not filled.** Camera dropouts are simply absent from the joined file.
+  The sidecar records each segment's wall-clock start and its offset in the file, which the
+  page, clips and timelapses use to stay accurate across gaps.
+- **It's robust to bad segments.** Segments with corrupt timestamps (common around camera
+  reboots) are trimmed to their real length. If ffmpeg chokes on an hour, the segments are
+  tested one by one and the bad ones dropped. A join that still fails is marked and skipped,
+  not retried forever.
+- **It's safe against an unmounted archive.** Nothing runs unless the archive contains a
+  marker file, so an unmounted mountpoint is never filled.
+
+## Requirements
+
+- **Frigate**, developed against **0.18**. It uses the internal API on port 5000:
+  `/api/config`, `/api/<camera>/recordings`, `/api/review`. Versions with the same endpoints
+  should work but are untested.
+- **Linux with systemd**, running on the Frigate host, with read access to Frigate's media
+  directory.
+- **python3 ≥ 3.9** (standard library only), plus **ffmpeg / ffprobe**, **rsync**, and
+  **flock** (util-linux).
+- **docker**, if the API is reached via `docker exec` (the default).
+- Optional: **mosquitto_pub** (mosquitto-clients) for MQTT status, and **nginx** with
+  `auth_request` for the review page.
+- **An archive filesystem** mounted on the host. Rough sizing: what Frigate writes per day ×
+  `KEEP_DAYS`. A 2K camera is about 13 GB/day; a 4K HEVC camera about 45 GB/day.
+
+## Install
+
+```bash
+git clone <this repo> && cd frigate-archive
+sudo ./install.sh                      # installs to /usr/local, creates /etc/frigate-archive/frigate-archive.conf
+sudo $EDITOR /etc/frigate-archive/frigate-archive.conf
+sudo touch /mnt/frigate-archive/.frigate-archive     # on the mounted archive (your ARCHIVE path)
+sudo frigate-archive-tool check
+sudo systemctl enable --now frigate-archive.timer frigate-timelapse.timer
+```
+
+`install.sh` puts:
+
+| What | Where |
+|---|---|
+| `frigate-archive`, `frigate-archive-tool`, `frigate-clip` (a link to the tool) | `$PREFIX/bin` |
+| The review page | `$PREFIX/share/frigate-archive/www/` (`--www-dir` to change) |
+| README, example config, nginx example | `$PREFIX/share/doc/frigate-archive/` |
+| systemd units | `/etc/systemd/system/` |
+| Config, only if it doesn't exist yet (mode 600) | `/etc/frigate-archive/frigate-archive.conf` |
+
+Options:
+
+| Option | Effect |
+|---|---|
+| `--prefix DIR` | Install somewhere other than `/usr/local` |
+| `--www-dir DIR` | Put the review page somewhere else |
+| `--enable` | Also enable and start both timers |
+| `--no-systemd` | Skip the units |
+| `--uninstall` | Remove everything except your config and the archive |
+
+**Updating:** `git pull && sudo ./install.sh`. It's safe while a sync is running: files are
+replaced, not edited in place. Your config is never overwritten. If it's missing settings
+that a newer example has, install prints a note and the defaults apply.
+
+**Timezone:** if `TZ` is set in the config, install adds a systemd drop-in so the nightly
+timelapse runs at 01:30 *in that zone*, even when the system clock is UTC.
+
+### Archive mount tips
+
+For NFS, use a **hard** mount with automount, e.g.:
+
+```
+nas:/export/frigate-archive  /mnt/frigate-archive  nfs  _netdev,nofail,hard,x-systemd.automount,x-systemd.mount-timeout=30  0 0
+```
+
+- **Why `hard`:** a `soft` mount returns I/O errors when the server is slow. With `hard`, an
+  outage just stalls the sync until the server is back. Runs can't overlap, and the stall
+  shows up as a stale `last_success`.
+- **Permissions:** the archive must be writable by root. With root squash or mapall, give the
+  export's directory to the mapped user. The scripts never chown, so that works.
+
+## Configuration
+
+`/etc/frigate-archive/frigate-archive.conf` uses shell-style `KEY=value` lines. Environment
+variables with the same names override it, which is handy for testing. Point
+`FRIGATE_ARCHIVE_CONF` at a different file to use another config.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `ARCHIVE` | `/mnt/frigate-archive` | Archive root. Must contain `.frigate-archive`. |
+| `FRIGATE_MEDIA` | `/opt/frigate/data` | Host path of Frigate's `/media/frigate` (has `recordings/`, `clips/`) |
+| `FRIGATE_API` | `docker:frigate` | `docker:<container>` (curl inside the container) or `http://host:5000` |
+| `KEEP_DAYS` | `14` | Archive retention (footage, timelapses, thumbnails) |
+| `RAW_WINDOW_MIN` | `120` | Stage raw segments this recent until their hour is joined |
+| `CONSOLIDATE_AFTER_MIN` | `15` | Wait after an hour ends before joining it |
+| `CONSOLIDATE_BUDGET_MIN` | `8` | Per run, don't start another hour after this |
+| `SETTLE_MIN` | `2` | Skip segments Frigate may still be writing |
+| `BWLIMIT` | `30M` | rsync bandwidth cap for staging |
+| `TIMELAPSE_CAMERAS` | *(none)* | Cameras that get a nightly timelapse |
+| `TIMELAPSE_INTERVAL` / `TIMELAPSE_FPS` | `8` / `30` | One frame per N seconds of footage, at this frame rate |
+| `TZ` | *(system)* | Timezone that defines a "day" for timelapses and clip times |
+| `STATUS_FILE` | `/var/lib/frigate-archive/status.json` | Status written every run |
+| `MQTT_HOST`, `MQTT_PORT`, `MQTT_USER`, `MQTT_TOPIC` | *(off)*, `1883`, –, `frigate/archive/status` | Optional retained MQTT status |
+| `MQTT_PASSWORD` / `MQTT_PASSWORD_FILE` / `MQTT_PASSWORD_KEY` | – | Inline; a file holding the password; or `KEY=value` looked up in an env file (e.g. reuse Frigate's `.env`) |
+| `LOCK_FILE`, `TMP_DIR` | `/run/frigate-archive.lock`, `/var/tmp/frigate-archive` | Internals |
+
+`frigate-archive.conf.example` documents each setting in place.
+
+## Frigate settings
+
+frigate-archive doesn't change Frigate's config. Its value comes from pairing it with short
+local retention, for example:
+
+```yaml
+record:
+  enabled: true
+  continuous:
+    days: 0.5          # 12h of everything locally; the archive has the rest
+  motion:
+    days: 0.5
+  alerts:
+    retain:
+      days: 30         # only the segments around each alert: cheap, and still reviewable in Frigate
+  detections:
+    retain:
+      days: 14
+```
+
+Things to know:
+
+- **Alerts and detections are cheap to keep locally.** Frigate keeps only the few seconds
+  around each event, typically a few hundred MB/day for a handful of cameras. Long alert
+  retention means you don't have to review within the 12-hour window.
+- **Local retention is your recovery window.** If the archive is unreachable for longer than
+  Frigate's local retention, footage from that gap is lost. Keep it comfortably above how long
+  the archive could plausibly be down, and alert on the status.
+- **Before cutting local retention**, run `frigate-archive-tool harvest`. Frigate deletes
+  motion data and review items together with footage. Harvest saves them for hours that
+  haven't been joined yet, and the join picks them up automatically.
+
+## Review page
+
+The page is one static HTML file with no build step. It reads `index.json`, the hourly
+sidecars and the mp4s straight from the archive. Serve both through the nginx that fronts
+Frigate. `contrib/nginx-archive.conf` gates them on **Frigate's own login**: nginx asks
+Frigate's `/api/profile` whether the `frigate_token` cookie is valid, and sends you to
+`/login` if not.
+
+```nginx
+# inside the server { } that proxies Frigate — full example in contrib/nginx-archive.conf
+location /archive/      { auth_request /_archive_auth; alias /usr/local/share/frigate-archive/www/; }
+location /archive/data/ { auth_request /_archive_auth; alias /mnt/frigate-archive/; }
+```
+
+Features:
+
+- **Timeline**, one row per camera for the day:
+  - grey where footage exists;
+  - blue bars for motion *above that camera's usual level* (cameras with constant background
+    motion don't saturate);
+  - red and amber markers for alerts and detections.
+  - Click anywhere to play from that moment. A zoom strip shows ±30 minutes around the playhead.
+- **Player:**
+  - continuous across hour boundaries, with the real date and time overlaid;
+  - 1–16× speed, ±30 s / ±5 min, previous/next event;
+  - a link to download the hour, and a ready-made `frigate-clip` command for the current moment.
+- **Events:** thumbnails, labels, sub-labels (e.g. recognized faces) and zones, filterable by
+  severity and camera.
+- **Timelapse mode:** a clock shows each frame's real time. Click the timeline to seek, and
+  *Open footage at this moment* to jump into the real footage.
+
+| Key | Action |
+|---|---|
+| `space` | Play / pause |
+| `←` `→` | ±10 s (`shift`: ±1 min) |
+| `[` `]` | Slower / faster |
+| `n` `p` | Next / previous event |
+
+**Codecs:** footage plays in its original codec. **HEVC/H.265** plays in Chrome or Edge with
+hardware decoding, and in Safari. Firefox can't play it; use the download link. Timelapses
+are H.264 and play anywhere.
+
+The most recent hour or so isn't joined yet, so it's only in Frigate's own UI.
+
+## Command line
+
+```
+frigate-archive [-v]                    one sync run (normally the timer does this); -v for details
+
+frigate-archive-tool check              validate config, dependencies, archive and Frigate API
+frigate-archive-tool consolidate        join finished hours (time-boxed)
+frigate-archive-tool index              rebuild index.json, prune past KEEP_DAYS
+frigate-archive-tool harvest            save Frigate metadata for not-yet-joined hours
+frigate-archive-tool timelapse [YYYY-MM-DD] [--cams a,b]   default: yesterday, TIMELAPSE_CAMERAS
+
+frigate-clip <camera> <start> <duration> [out.mp4]
+    frigate-clip garden "2026-10-22 14:00" 45m      -> ARCHIVE/clips/garden_20261022_140000_45m.mp4
+    frigate-clip garden 07:45 5m                    today, local time
+```
+
+- **Clip times** are local (`TZ`). Durations look like `90s`, `45m` or `1h30m`.
+- **Clips are cut without re-encoding**, so they snap to keyframes, which are usually
+  1–2 s apart.
+- **Codec changes:** a range that spans one produces `…p2.mp4` as well.
+
+All tool commands are safe to run by hand while the timers are active. Each process uses its
+own scratch directory.
+
+## Archive layout
+
+Dates and hours under `recordings/` and `hourly/` are **UTC**, matching Frigate's own layout.
+
+| Path | Contents |
+|---|---|
+| `.frigate-archive` | Marker. Nothing runs without it. |
+| `recordings/<date>/<HH>/<cam>/MM.SS.mp4` | Raw staging for recent hours |
+| `hourly/<cam>/<date>/<HH>.mp4` (`.p2.mp4`, …) | Joined footage: faststart; HEVC tagged `hvc1` for browsers |
+| `hourly/<cam>/<date>/<HH>.json` | Sidecar (below) |
+| `hourly/<cam>/<date>/<HH>.failed` | A join that failed, with the error. Delete it to retry. |
+| `thumbs/<cam>/<review-id>.webp` | Review thumbnails |
+| `timelapse/<cam>/<local date>.mp4` / `.json` | Timelapse and its frame → wall-clock map |
+| `clips/` | `frigate-clip` output |
+| `.meta/<cam>/<date>/<HH>.json` | Harvested Frigate metadata awaiting a join |
+| `index.json` | Cameras, available hours, timelapse days |
+
+Sidecar format:
+
+```json
+{"camera": "garden", "date": "2026-10-22", "hour": "14", "start": 1792677600,
+ "parts": [{"file": "14.mp4", "codec": "hevc", "w": 2560, "h": 1440,
+            "segs": [[1792677600.04, 0.0, 10.06, 351, 0], ...]}],
+ "review": [{"id": "1792678011.4-ab12cd", "start": 1792678011.4, "end": 1792678030.1,
+             "severity": "alert", "objects": ["person"], "sub_labels": [], "zones": ["patio"],
+             "thumb": true}]}
+```
+
+Each `segs` row is `[wall-clock start (epoch), offset in file (s), duration (s), Frigate
+motion, Frigate active objects]`.
+
+## Status and alerting
+
+Every run writes `STATUS_FILE`, and publishes the same JSON as a retained MQTT message if
+`MQTT_HOST` is set:
+
+```json
+{"state":"ok","message":"synced","time":1792732073,"last_success":1792732073,
+ "archive_free_gb":1877,"newest":"2026-10-23/04/garden/55.59.mp4",
+ "consolidate":{"consolidated":3,"failed":0}}
+```
+
+- **`state`** is `ok` or `error`, with the reason in `message`. Possible errors: marker
+  missing, rsync failed, newest segment missing from the archive.
+- **`last_success`** is kept across failures. **Alert when it's more than about an hour
+  old.** That catches errors and also a dead timer or host, which never publish anything.
+- **`consolidate`** shows how the last join step went. Join failures don't fail the sync,
+  because the footage is already safe in staging.
+
+Home Assistant example:
+
+```yaml
+mqtt:
+  sensor:
+    - name: Frigate archive last success
+      state_topic: frigate/archive/status
+      value_template: "{{ value_json.last_success | timestamp_custom('%Y-%m-%dT%H:%M:%S%z') }}"
+      device_class: timestamp
+# then alert when now() - that sensor > 1 hour
+```
+
+## Operations
+
+**Is it healthy?**
+
+```bash
+frigate-archive-tool check
+cat /var/lib/frigate-archive/status.json
+systemctl list-timers 'frigate-*'
+journalctl -u frigate-archive -n 50 -o cat
+find /mnt/frigate-archive/hourly -name '*.failed'
+```
+
+**Archive was unreachable.** Nothing to do if it's back within Frigate's local retention: the
+next runs stage and join from local disk. Footage older than local retention at that point
+is lost.
+
+**A join failed.** Read `<HH>.failed`, then delete it to retry. A retry can only succeed while
+the hour's segments still exist locally or in staging.
+
+**First run with existing footage.** The backlog is joined newest first, a few minutes per
+run, so the most recent days become reviewable first. Run `harvest` once first if Frigate's
+local retention is short.
+
+**Changing archive retention.** Set `KEEP_DAYS`. Pruning happens on the next run.
+
+**Adding a camera.** Nothing to do: every camera that writes recordings is archived. Add it
+to `TIMELAPSE_CAMERAS` if you want timelapses.
+
+## Limitations
+
+- **Single host.** It runs where Frigate's media directory is readable. Remote Frigate
+  instances aren't supported.
+- **Recent footage isn't on the page.** About the last hour is only in Frigate's UI (by
+  design: hours are joined when they're finished).
+- **ffmpeg HEVC crashes.** Some ffmpeg builds' HEVC decoders occasionally crash on certain
+  camera streams. Joins work around it by dropping the offending segment, and timelapses by
+  falling back to a full decode.
+- **Browser codec support** limits HEVC playback on the page; see above.
+- **Single-user page.** It's a static page with no per-user state. Anyone who can log in to
+  Frigate can see every camera's archive.
+
+## License
+
+[MIT](LICENSE)

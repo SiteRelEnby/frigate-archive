@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# local configs used for testing
+/*.local.conf

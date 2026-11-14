@@ -1,0 +1,671 @@
+#!/usr/bin/env python3
+"""
+frigate-archive-tool — turn the archive of Frigate recordings into something reviewable.
+
+Called by frigate-archive (the sync, every few minutes) after each successful rsync:
+  consolidate    join each finished hour of 10s segments into one mp4 per camera, plus a
+                 sidecar JSON (wall-clock map, motion, Frigate review items). Joins from
+                 LOCAL segments where present (only recent hours are staged raw on the
+                 archive), so the archive filesystem sees each byte about once.
+  index          rebuild index.json for the review page; prune past retention
+  filter         stdin: segment paths -> stdout: those whose hour isn't consolidated yet
+Nightly (frigate-timelapse.timer):
+  timelapse [YYYY-MM-DD] [--cams a,b]     default: yesterday (local), TIMELAPSE_CAMERAS
+Manual:
+  clip <camera> <start> <duration> [out]   e.g.  clip garden "2026-10-21 14:00" 45m
+                                           (also installed as `frigate-clip`)
+  harvest        save Frigate metadata for not-yet-joined hours (run before cutting
+                 Frigate's local retention)
+  check          validate config and dependencies
+
+Configuration: /etc/frigate-archive/frigate-archive.conf (or $FRIGATE_ARCHIVE_CONF).
+Environment variables with the same names override the file.
+
+Archive layout (UTC dates/hours, same as Frigate's recordings dir):
+  recordings/<date>/<HH>/<cam>/MM.SS.mp4   raw staging for recent hours (rsync target)
+  hourly/<cam>/<date>/<HH>.json            sidecar; lists the hour's mp4 part(s)
+  hourly/<cam>/<date>/<HH>[.pN].mp4        a new part starts if codec/resolution changes
+  thumbs/<cam>/<review-id>.webp
+  timelapse/<cam>/<local-date>.mp4|.json
+  clips/                                   output of `clip`
+  index.json
+"""
+import argparse
+import bisect
+import calendar
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
+
+# --- configuration -----------------------------------------------------------
+
+DEFAULTS = {
+    "ARCHIVE": "/mnt/frigate-archive",
+    "FRIGATE_MEDIA": "/opt/frigate/data",   # host path mounted at /media/frigate in the container
+    "FRIGATE_API": "docker:frigate",        # docker:<container> or http://host:5000 (unauthenticated port)
+    "KEEP_DAYS": "14",
+    "CONSOLIDATE_AFTER_MIN": "15",
+    "CONSOLIDATE_BUDGET_MIN": "8",
+    "TIMELAPSE_CAMERAS": "",
+    "TIMELAPSE_INTERVAL": "8",
+    "TIMELAPSE_FPS": "30",
+    "TZ": "",
+    "TMP_DIR": "/var/tmp/frigate-archive",
+    # used by the bash sync (frigate-archive); listed here so `check` can report on them
+    "BWLIMIT": "30M",
+    "SETTLE_MIN": "2",
+    "RAW_WINDOW_MIN": "120",
+    "MQTT_HOST": "",
+    "MQTT_PORT": "1883",
+    "MQTT_USER": "",
+    "MQTT_PASSWORD": "",
+    "MQTT_PASSWORD_FILE": "",
+    "MQTT_PASSWORD_KEY": "",
+    "MQTT_TOPIC": "frigate/archive/status",
+    "STATUS_FILE": "/var/lib/frigate-archive/status.json",
+    "LOCK_FILE": "/run/frigate-archive.lock",
+}
+CONF_PATH = os.environ.get("FRIGATE_ARCHIVE_CONF", "/etc/frigate-archive/frigate-archive.conf")
+
+
+def load_conf(path):
+    """Shell-style KEY=value file (the bash sync sources the same file). Env vars override."""
+    conf = dict(DEFAULTS)
+    if os.path.exists(path):
+        for line in open(path):
+            m = re.match(r"\s*([A-Z_][A-Z0-9_]*)=(.*)$", line)
+            if not m:
+                continue
+            v = m[2].strip()
+            q = re.match(r"""^(["'])(.*?)\1""", v)
+            if q:
+                v = q[2]                                # quoted: take the inside, ignore the rest
+            else:
+                v = re.sub(r"\s+#.*$", "", v).strip()  # trailing comment on an unquoted value
+            conf[m[1]] = v
+    for k in conf:
+        if k in os.environ:
+            conf[k] = os.environ[k]
+    return conf
+
+
+CONF = load_conf(CONF_PATH)
+if CONF["TZ"]:
+    os.environ["TZ"] = CONF["TZ"]
+    time.tzset()
+
+ARCHIVE = Path(CONF["ARCHIVE"])
+MEDIA = Path(CONF["FRIGATE_MEDIA"])
+SRC = MEDIA / "recordings"
+CLIPS_SRC = MEDIA / "clips"
+CONTAINER_MEDIA = "/media/frigate"
+KEEP_DAYS = float(CONF["KEEP_DAYS"])
+CONSOLIDATE_AFTER = float(CONF["CONSOLIDATE_AFTER_MIN"]) * 60
+CONSOLIDATE_BUDGET = float(CONF["CONSOLIDATE_BUDGET_MIN"]) * 60
+MAX_SEG = 60                    # Frigate writes ~10s segments; anything claiming longer is corrupt
+TL_CAMS = [c for c in re.split(r"[\s,]+", CONF["TIMELAPSE_CAMERAS"]) if c]
+TL_INTERVAL = int(CONF["TIMELAPSE_INTERVAL"])
+TL_FPS = int(CONF["TIMELAPSE_FPS"])
+
+RAW = ARCHIVE / "recordings"
+HOURLY = ARCHIVE / "hourly"
+THUMBS = ARCHIVE / "thumbs"
+TIMELAPSE = ARCHIVE / "timelapse"
+META = ARCHIVE / ".meta"        # harvested Frigate metadata for hours not yet joined (see harvest)
+MARKER = ARCHIVE / ".frigate-archive"
+TMP = None                      # per-process scratch dir, created in main()
+
+
+def log(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+# --- helpers -----------------------------------------------------------------
+
+def api(path):
+    """GET Frigate's internal API. Returns parsed JSON or None."""
+    base = CONF["FRIGATE_API"]
+    try:
+        if base.startswith("docker:"):
+            # port 5000 is usually container-only; reach it from inside
+            out = subprocess.run(
+                ["docker", "exec", base[7:], "curl", "-sf", f"http://127.0.0.1:5000/api/{path}"],
+                capture_output=True, timeout=60,
+            ).stdout
+        else:
+            with urllib.request.urlopen(f"{base.rstrip('/')}/api/{path}", timeout=60) as r:
+                out = r.read()
+        return json.loads(out) if out else None
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return None
+
+
+def ffprobe(path):
+    """-> (signature, duration) or (None, None) if unreadable."""
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "stream=codec_type,codec_name,width,height,duration:format=duration", "-of", "json", str(path)],
+        capture_output=True, text=True,
+    )
+    try:
+        d = json.loads(r.stdout)
+        v = next(s for s in d["streams"] if s["codec_type"] == "video")
+        a = next((s["codec_name"] for s in d["streams"] if s["codec_type"] == "audio"), None)
+        # prefer the video stream's duration: glitchy segments (camera reboots) can carry a
+        # stray audio timestamp that inflates the container duration to ~a day
+        dur = float(v.get("duration") or d["format"]["duration"])
+        return (v["codec_name"], v["width"], v["height"], a), dur
+    except (KeyError, StopIteration, ValueError, json.JSONDecodeError):
+        return None, None
+
+
+def ffmpeg(*args):
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", *args],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed: {r.stderr.strip()[-500:]}")
+
+
+def hour_epoch(date, hh):
+    return calendar.timegm(time.strptime(f"{date} {hh}", "%Y-%m-%d %H"))
+
+
+def utc_parts(epoch):
+    t = time.gmtime(epoch)
+    return time.strftime("%Y-%m-%d", t), time.strftime("%H", t)
+
+
+def write_json(path, obj):
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(obj, separators=(",", ":")))
+    os.replace(tmp, path)
+
+
+def publish_file(local, dest):
+    """Copy a finished local file into the archive atomically."""
+    tmp = dest.with_name(f".{dest.name}.tmp")
+    shutil.copyfile(local, tmp)
+    os.replace(tmp, dest)
+
+
+def sidecar(cam, date, hh):
+    return HOURLY / cam / date / f"{hh}.json"
+
+
+def load_hour(cam, epoch):
+    date, hh = utc_parts(epoch)
+    p = sidecar(cam, date, hh)
+    return json.loads(p.read_text()) if p.exists() else None
+
+
+def file_to_wall(segs, t):
+    """Map a time offset inside a joined part to wall-clock epoch."""
+    offs = [s[1] for s in segs]
+    i = max(0, bisect.bisect_right(offs, t) - 1)
+    start, off, dur = segs[i][:3]
+    return start + min(t - off, dur)
+
+
+# --- consolidate -------------------------------------------------------------
+
+def hours_to_consolidate():
+    """(date, hh, cam) for finished hours that exist locally or staged and have no sidecar yet."""
+    found = set()
+    for root in (SRC, RAW):
+        if not root.is_dir():
+            continue
+        for d in root.glob("[0-9]*-*-*/[0-2][0-9]/*"):
+            if d.is_dir():
+                found.add((d.parent.parent.name, d.parent.name, d.name))
+    now = time.time()
+    for date, hh, cam in sorted(found, reverse=True):     # newest first
+        if now < hour_epoch(date, hh) + 3600 + CONSOLIDATE_AFTER:
+            continue
+        if hour_epoch(date, hh) < now - KEEP_DAYS * 86400:
+            continue                                   # would be pruned straight away
+        if sidecar(cam, date, hh).exists():
+            # joined already; just drop any leftover staging
+            shutil.rmtree(RAW / date / hh / cam, ignore_errors=True)
+            continue
+        if (HOURLY / cam / date / f"{hh}.failed").exists():
+            continue
+        yield date, hh, cam
+
+
+def join(g, vcodec, out):
+    lst = TMP / "concat.txt"
+    # outpoint/duration pin each segment to its known length, so stray far-future
+    # timestamps in a glitchy segment are dropped instead of stretching the timeline
+    lst.write_text("ffconcat version 1.0\n" + "".join(
+        f"file '{s['path']}'\noutpoint {s['dur']:.3f}\nduration {s['dur']:.3f}\n" for s in g))
+    ffmpeg("-f", "concat", "-safe", "0", "-i", str(lst), "-map", "0:v", "-map", "0:a?", "-c", "copy",
+           *(["-tag:v", "hvc1"] if vcodec == "hevc" else []),   # hvc1 tag so browsers play HEVC mp4
+           "-movflags", "+faststart", str(out))
+
+
+def consolidate_hour(date, hh, cam):
+    start = hour_epoch(date, hh)
+    files = {}
+    for root in (RAW, SRC):                            # local copy wins over staged
+        for f in (root / date / hh / cam).glob("*.mp4"):
+            if re.fullmatch(r"\d\d\.\d\d\.mp4", f.name):
+                files[f.name] = f
+    if not files:
+        return
+    meta_file = META / cam / date / f"{hh}.json"
+    meta = json.loads(meta_file.read_text()) if meta_file.exists() else {}
+    recs = api(f"{cam}/recordings?after={start}&before={start + 3600}") or meta.get("recordings", [])
+    recs = {int(r["start_time"]): r for r in recs}
+
+    segs = []
+    for name in sorted(files):
+        mm, ss = name[:5].split(".")
+        t = start + int(mm) * 60 + int(ss)
+        r = recs.get(t, {})
+        segs.append({"path": files[name], "start": r.get("start_time", t), "dur": r.get("duration"),
+                     "motion": r.get("motion"), "objects": r.get("objects")})
+
+    # codec/resolution: probe the ends; only probe everything if they differ (e.g. camera reconfigured)
+    first, _ = ffprobe(segs[0]["path"])
+    last, _ = ffprobe(segs[-1]["path"])
+    uniform = first is not None and first == last
+    for s in segs:
+        if uniform and s["dur"]:
+            s["sig"] = first
+        else:
+            s["sig"], d = ffprobe(s["path"])
+            s["dur"] = s["dur"] or d
+    bad = [s for s in segs if not s["sig"] or not s["dur"] or not 0 < s["dur"] < MAX_SEG]
+    for s in bad:
+        log(f"  skipping unreadable segment {s['path']}")
+    segs = [s for s in segs if s not in bad]
+
+    groups = []
+    for s in segs:
+        if not groups or groups[-1][-1]["sig"] != s["sig"]:
+            groups.append([])
+        groups[-1].append(s)
+    # a camera dropping out can leave a lone fragment of a few frames; nothing worth a part
+    groups = [g for g in groups if sum(s["dur"] for s in g) >= 1]
+
+    outdir = HOURLY / cam / date
+    outdir.mkdir(parents=True, exist_ok=True)
+    parts = []
+    for k, g in enumerate(groups):
+        name = f"{hh}.mp4" if k == 0 else f"{hh}.p{k + 1}.mp4"
+        out = TMP / name
+        vcodec = g[0]["sig"][0]
+        try:
+            join(g, vcodec, out)
+        except RuntimeError as e:
+            # usually one corrupt segment crashing ffmpeg: test each alone, drop failures, retry once
+            log(f"  {cam} {date} {hh}Z {name}: {e} — checking segments individually")
+            ok = [s for s in g if subprocess.run(
+                ["ffmpeg", "-v", "error", "-nostdin", "-i", str(s["path"]), "-map", "0", "-c", "copy", "-f", "null", "-"],
+                capture_output=True).returncode == 0]
+            log(f"  dropping {len(g) - len(ok)} bad segment(s)")
+            if not ok or len(ok) == len(g):
+                raise
+            g[:] = ok
+            join(g, vcodec, out)
+        expect = sum(s["dur"] for s in g)
+        _, got = ffprobe(out)
+        if not got or abs(got - expect) > max(5, expect * 0.03):
+            raise RuntimeError(f"{name}: joined duration {got} vs expected {expect:.1f}")
+        publish_file(out, outdir / name)
+        out.unlink()
+        off, rows = 0.0, []
+        for s in g:
+            rows.append([round(s["start"], 2), round(off, 2), round(s["dur"], 2), s["motion"], s["objects"]])
+            off += s["dur"]
+        parts.append({"file": name, "codec": vcodec, "w": g[0]["sig"][1], "h": g[0]["sig"][2], "segs": rows})
+
+    review = []
+    for r in api(f"review?cameras={cam}&after={start}&before={start + 3600}&limit=1000") or meta.get("review", []):
+        if not start <= r["start_time"] < start + 3600:   # each item belongs to the hour it started in
+            continue
+        d = r.get("data") or {}
+        copy_thumb(cam, r)
+        has_thumb = (THUMBS / cam / f"{r['id']}.webp").exists()
+        review.append({"id": r["id"], "start": r["start_time"], "end": r["end_time"], "severity": r["severity"],
+                       "objects": list(dict.fromkeys(o.removesuffix("-verified") for o in d.get("objects", []))),
+                       "sub_labels": d.get("sub_labels", []), "zones": d.get("zones", []), "thumb": has_thumb})
+
+    write_json(outdir / f"{hh}.json", {"camera": cam, "date": date, "hour": hh, "start": start,
+                                       "parts": parts, "review": review})
+    shutil.rmtree(RAW / date / hh / cam, ignore_errors=True)
+    meta_file.unlink(missing_ok=True)
+
+
+def copy_thumb(cam, r):
+    tp = r.get("thumb_path") or ""
+    if not tp.startswith(f"{CONTAINER_MEDIA}/clips/"):
+        return
+    src = CLIPS_SRC / Path(tp).relative_to(f"{CONTAINER_MEDIA}/clips")
+    dest = THUMBS / cam / f"{r['id']}.webp"
+    if src.exists() and not dest.exists():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dest)
+
+
+def cmd_harvest(_args):
+    """Save Frigate's per-hour metadata (segment motion/durations, review items + thumbs) for every
+    hour not yet joined, so it survives Frigate deleting local footage before consolidation gets there.
+    Run before cutting local retention; consolidate falls back to it automatically."""
+    cfg = api("config")
+    if not cfg:
+        sys.exit("can't reach Frigate's API (FRIGATE_API)")
+    now = int(time.time())
+    for cam in sorted(cfg["cameras"]):
+        n = 0
+        for day0 in range(int(now - KEEP_DAYS * 86400) // 86400 * 86400, now, 86400):
+            recs = api(f"{cam}/recordings?after={day0}&before={day0 + 86400}") or []
+            revs = api(f"review?cameras={cam}&after={day0}&before={day0 + 86400}&limit=10000") or []
+            for ep in range(day0, day0 + 86400, 3600):
+                date, hh = utc_parts(ep)
+                if sidecar(cam, date, hh).exists():
+                    continue
+                hr = [{k: r[k] for k in ("start_time", "duration", "motion", "objects")}
+                      for r in recs if ep <= r["start_time"] < ep + 3600]
+                hv = [r for r in revs if ep <= r["start_time"] < ep + 3600]
+                if not hr and not hv:
+                    continue
+                for r in hv:
+                    copy_thumb(cam, r)
+                (META / cam / date).mkdir(parents=True, exist_ok=True)
+                write_json(META / cam / date / f"{hh}.json", {"recordings": hr, "review": hv})
+                n += 1
+        log(f"harvest {cam}: {n} hours")
+
+
+def cmd_consolidate(_args):
+    t0, done, failed = time.time(), 0, 0
+    for date, hh, cam in hours_to_consolidate():
+        if time.time() - t0 > CONSOLIDATE_BUDGET:
+            log("consolidate: time budget used, continuing next run")
+            break
+        try:
+            consolidate_hour(date, hh, cam)
+            done += 1
+            log(f"consolidated {cam} {date} {hh}Z")
+        except Exception as e:                          # keep going; mark so we don't retry forever
+            failed += 1
+            log(f"FAILED {cam} {date} {hh}Z: {e}")
+            (HOURLY / cam / date).mkdir(parents=True, exist_ok=True)
+            (HOURLY / cam / date / f"{hh}.failed").write_text(str(e))
+    for d in sorted(RAW.glob("*/*/*"), reverse=True) + sorted(RAW.glob("*/*"), reverse=True) + sorted(RAW.glob("*")):
+        if d.is_dir() and not any(d.iterdir()):
+            d.rmdir()
+    print(json.dumps({"consolidated": done, "failed": failed}))
+    return 1 if failed else 0
+
+
+def cmd_filter(_args):
+    seen = {}
+    for line in sys.stdin:
+        p = line.strip()
+        m = re.match(r"(\d{4}-\d\d-\d\d)/(\d\d)/([^/]+)/", p)
+        if not m:
+            continue
+        if m.groups() not in seen:
+            seen[m.groups()] = not sidecar(m[3], m[1], m[2]).exists()
+        if seen[m.groups()]:
+            print(p)
+
+
+# --- index / prune -----------------------------------------------------------
+
+def cmd_index(_args):
+    cutoff = time.time() - KEEP_DAYS * 86400
+    cams = {}
+    for camdir in sorted(HOURLY.glob("*")) if HOURLY.is_dir() else []:
+        hours = []
+        for j in sorted(camdir.glob("*/*.json")):
+            ep = hour_epoch(j.parent.name, j.stem)
+            if ep + 3600 < cutoff:
+                for f in j.parent.glob(f"{j.stem}.*"):
+                    f.unlink()
+                continue
+            hours.append(ep)
+        for d in camdir.glob("*"):
+            if d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
+        cams.setdefault(camdir.name, {})["hours"] = hours
+    today = dt.date.today()
+    for camdir in sorted(TIMELAPSE.glob("*")) if TIMELAPSE.is_dir() else []:
+        days = []
+        for j in sorted(camdir.glob("*.json")):
+            if (today - dt.date.fromisoformat(j.stem)).days > KEEP_DAYS:
+                j.unlink()
+                j.with_suffix(".mp4").unlink(missing_ok=True)
+                continue
+            if j.with_suffix(".mp4").exists():
+                days.append(j.stem)
+        cams.setdefault(camdir.name, {})["timelapse"] = days
+    for t in THUMBS.glob("*/*.webp") if THUMBS.is_dir() else []:
+        try:
+            if float(t.stem.split("-")[0]) < cutoff:
+                t.unlink()
+        except ValueError:
+            pass
+    for c in cams.values():
+        c.setdefault("hours", [])
+        c.setdefault("timelapse", [])
+    write_json(ARCHIVE / "index.json", {"generated": int(time.time()), "keep_days": KEEP_DAYS,
+                                        "cameras": cams})
+
+
+# --- timelapse ---------------------------------------------------------------
+
+def local_day_bounds(day):
+    """Local midnight to midnight as epochs (naive -> astimezone resolves DST, so 23/25h days work)."""
+    s = dt.datetime.combine(day, dt.time()).astimezone()
+    e = dt.datetime.combine(day + dt.timedelta(days=1), dt.time()).astimezone()
+    return int(s.timestamp()), int(e.timestamp())
+
+
+def cmd_timelapse(args):
+    day = dt.date.fromisoformat(args.date) if args.date else dt.date.today() - dt.timedelta(days=1)
+    cams = args.cams.split(",") if args.cams else TL_CAMS
+    if not cams:
+        log("no cameras: set TIMELAPSE_CAMERAS or pass --cams")
+        return 0
+    s, e = local_day_bounds(day)
+    rc = 0
+    for cam in cams:
+        chunks, frames = [], []
+        for ep in range(s - s % 3600, e, 3600):
+            h = load_hour(cam, ep)
+            if not h:
+                continue
+            date, _ = utc_parts(ep)
+            for part in h["parts"]:
+                chunk = TMP / f"tl-{cam}-{len(chunks):03d}.mp4"
+                ff = ["-i", str(HOURLY / cam / date / part["file"]), "-an",
+                      "-vf", f"fps=1/{TL_INTERVAL},scale=1280:720:force_original_aspect_ratio=decrease,"
+                             f"pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,setpts=N/{TL_FPS}/TB",
+                      "-fps_mode", "cfr", "-r", str(TL_FPS),
+                      "-c:v", "libx264", "-preset", "veryfast", "-crf", "27", "-pix_fmt", "yuv420p", str(chunk)]
+                try:
+                    ffmpeg("-skip_frame", "nokey", *ff)    # keyframes only: cheap even for 4K HEVC
+                except RuntimeError as ex:
+                    # some ffmpeg builds' HEVC decoders crash in keyframe-only mode on some
+                    # camera streams; a full decode is slower but gets through
+                    log(f"  {cam} {part['file']}: {ex} — retrying with full decode")
+                    try:
+                        ffmpeg(*ff)
+                    except RuntimeError as ex2:
+                        log(f"  {cam} {part['file']}: {ex2}")
+                        continue
+                n = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v", "-count_packets",
+                                    "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(chunk)],
+                                   capture_output=True, text=True).stdout.strip()
+                n = int(n) if n.isdigit() else 0
+                if not n:
+                    continue
+                frames += [int(file_to_wall(part["segs"], i * TL_INTERVAL)) for i in range(n)]
+                chunks.append(chunk)
+        if not chunks:
+            log(f"timelapse {cam} {day}: no footage")
+            continue
+        lst = TMP / "tl-concat.txt"
+        lst.write_text("ffconcat version 1.0\n" + "".join(f"file '{c}'\n" for c in chunks))
+        out = TMP / f"tl-{cam}.mp4"
+        try:
+            ffmpeg("-f", "concat", "-safe", "0", "-i", str(lst), "-c", "copy", "-movflags", "+faststart", str(out))
+            (TIMELAPSE / cam).mkdir(parents=True, exist_ok=True)
+            publish_file(out, TIMELAPSE / cam / f"{day}.mp4")
+            write_json(TIMELAPSE / cam / f"{day}.json", {"camera": cam, "date": str(day), "fps": TL_FPS,
+                                                         "interval": TL_INTERVAL, "frames": frames})
+            log(f"timelapse {cam} {day}: {len(frames)} frames ({len(frames) / TL_FPS / 60:.1f} min)")
+        except RuntimeError as ex:
+            log(f"timelapse {cam} {day} FAILED: {ex}")
+            rc = 1
+        finally:
+            for c in chunks:
+                c.unlink(missing_ok=True)
+            out.unlink(missing_ok=True)
+    cmd_index(None)
+    return rc
+
+
+# --- clip --------------------------------------------------------------------
+
+def parse_when(s):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%H:%M:%S", "%H:%M"):
+        try:
+            t = dt.datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+        if t.year == 1900:
+            t = dt.datetime.combine(dt.date.today(), t.time())
+        return int(t.astimezone().timestamp())
+    sys.exit(f"can't parse time '{s}' (use 'YYYY-MM-DD HH:MM' or 'HH:MM' for today, local time)")
+
+
+def parse_dur(s):
+    m = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", s)
+    if not m or not any(m.groups()):
+        sys.exit(f"can't parse duration '{s}' (e.g. 45m, 1h30m, 90s)")
+    h, mi, se = (int(x or 0) for x in m.groups())
+    return h * 3600 + mi * 60 + se
+
+
+def cmd_clip(args):
+    s = parse_when(args.start)
+    e = s + parse_dur(args.duration)
+    pieces = []                                         # (path, file_from, file_to, codec)
+    for ep in range(s - s % 3600, e, 3600):
+        h = load_hour(args.camera, ep)
+        if not h:
+            continue
+        date, _ = utc_parts(ep)
+        for part in h["parts"]:
+            hits = [(max(st, s) - st + off, min(st + du, e) - st + off)
+                    for st, off, du, *_ in part["segs"] if st < e and st + du > s]
+            if hits:
+                pieces.append((HOURLY / args.camera / date / part["file"], hits[0][0], hits[-1][1], part["codec"]))
+    if not pieces:
+        sys.exit("no archived footage in that range (the most recent hour is only in Frigate — use its Export)")
+    stamp = dt.datetime.fromtimestamp(s).strftime("%Y%m%d_%H%M%S")
+    out = Path(args.out) if args.out else ARCHIVE / "clips" / f"{args.camera}_{stamp}_{args.duration}.mp4"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    groups = []
+    for p in pieces:
+        if not groups or groups[-1][-1][3] != p[3]:
+            groups.append([])
+        groups[-1].append(p)
+    for k, g in enumerate(groups):
+        tmps = []
+        for i, (path, a, b, _) in enumerate(g):
+            t = TMP / f"clip-{i}.mp4"
+            ffmpeg("-ss", f"{a:.2f}", "-to", f"{b:.2f}", "-i", str(path), "-map", "0", "-c", "copy", str(t))
+            tmps.append(t)
+        lst = TMP / "clip-concat.txt"
+        lst.write_text("ffconcat version 1.0\n" + "".join(f"file '{t}'\n" for t in tmps))
+        dest = out if k == 0 else out.with_name(f"{out.stem}.p{k + 1}{out.suffix}")
+        local = TMP / "clip-out.mp4"
+        ffmpeg("-f", "concat", "-safe", "0", "-i", str(lst), "-c", "copy", "-movflags", "+faststart", str(local))
+        publish_file(local, dest)
+        for t in tmps + [local]:
+            t.unlink(missing_ok=True)
+        print(dest)
+
+
+# --- check -------------------------------------------------------------------
+
+def cmd_check(_args):
+    ok = True
+
+    def report(good, what, detail=""):
+        nonlocal ok
+        ok &= good
+        print(f"  [{'ok' if good else 'FAIL'}] {what}{f' — {detail}' if detail else ''}")
+
+    print(f"config: {CONF_PATH}{'' if os.path.exists(CONF_PATH) else ' (not found, using defaults)'}")
+    for tool in ("ffmpeg", "ffprobe", "rsync", "flock"):
+        report(bool(shutil.which(tool)), f"{tool} installed")
+    if CONF["MQTT_HOST"]:
+        report(bool(shutil.which("mosquitto_pub")), "mosquitto_pub installed (MQTT_HOST is set)")
+    if CONF["FRIGATE_API"].startswith("docker:"):
+        report(bool(shutil.which("docker")), "docker installed (FRIGATE_API=docker:…)")
+    report(SRC.is_dir(), f"Frigate recordings at {SRC}")
+    report(MARKER.exists(), f"archive marker {MARKER}", "" if MARKER.exists() else
+           "mount the archive, then: touch " + str(MARKER))
+    cfg = api("config")
+    report(bool(cfg), f"Frigate API via {CONF['FRIGATE_API']}")
+    if cfg:
+        cams = sorted(cfg.get("cameras", {}))
+        print(f"       cameras: {', '.join(cams)}")
+        for c in TL_CAMS:
+            report(c in cams, f"timelapse camera '{c}' exists in Frigate")
+        rec = cfg.get("record", {})
+        days = rec.get("continuous", {}).get("days")
+        if days is not None:
+            print(f"       Frigate local continuous retention: {days} days "
+                  f"(archive keeps {KEEP_DAYS:g}; raw staging covers the last "
+                  f"{CONF['RAW_WINDOW_MIN']} min)")
+    print(f"timezone for local days: {CONF['TZ'] or time.tzname[0] + ' (system)'}")
+    return 0 if ok else 1
+
+
+def main():
+    global TMP
+    if Path(sys.argv[0]).name == "frigate-clip":
+        sys.argv.insert(1, "clip")
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for name in ("consolidate", "index", "filter", "harvest", "check"):
+        sub.add_parser(name)
+    t = sub.add_parser("timelapse")
+    t.add_argument("date", nargs="?")
+    t.add_argument("--cams")
+    c = sub.add_parser("clip")
+    c.add_argument("camera")
+    c.add_argument("start")
+    c.add_argument("duration")
+    c.add_argument("out", nargs="?")
+    a = p.parse_args()
+    if a.cmd not in ("filter", "check") and not MARKER.exists():
+        sys.exit(f"{ARCHIVE} not mounted (marker {MARKER} missing)")
+    # private scratch dir per process, so a manual run can't collide with the timer's
+    Path(CONF["TMP_DIR"]).mkdir(parents=True, exist_ok=True)
+    TMP = Path(tempfile.mkdtemp(prefix=f"{a.cmd}-", dir=CONF["TMP_DIR"]))
+    try:
+        rc = {"consolidate": cmd_consolidate, "index": cmd_index, "filter": cmd_filter, "harvest": cmd_harvest,
+              "timelapse": cmd_timelapse, "clip": cmd_clip, "check": cmd_check}[a.cmd](a)
+    finally:
+        shutil.rmtree(TMP, ignore_errors=True)
+    sys.exit(rc or 0)
+
+
+if __name__ == "__main__":
+    main()

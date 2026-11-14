@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# frigate-archive — copy Frigate recordings off-server and keep them reviewable.
+#
+# Each run:
+#   1. stage raw 10s segments of recent, not-yet-joined hours into the archive (small exposure
+#      window if the server dies),
+#   2. frigate-archive-tool consolidate: join finished hours into hourly mp4s + sidecars,
+#   3. frigate-archive-tool index: rebuild the review page index, prune past KEEP_DAYS,
+#   4. publish a status JSON (file + optional retained MQTT message).
+#
+# Run by frigate-archive.timer. Manual: frigate-archive [-v]
+# Config: /etc/frigate-archive/frigate-archive.conf (or $FRIGATE_ARCHIVE_CONF); env vars override it.
+#
+# If Frigate keeps little footage locally, this job is the only thing standing between that
+# footage and deletion: alert on last_success in the status going stale.
+
+set -euo pipefail
+
+CONF=${FRIGATE_ARCHIVE_CONF:-/etc/frigate-archive/frigate-archive.conf}
+TOOL="$(dirname "$(readlink -f "$0")")/frigate-archive-tool"
+
+# KEY=value lines; same rules as frigate-archive-tool (quotes stripped, env vars win)
+if [[ -f $CONF ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line =~ ^[[:space:]]*([A-Z_][A-Z0-9_]*)=(.*)$ ]] || continue
+        k=${BASH_REMATCH[1]} v=${BASH_REMATCH[2]}
+        [[ -v $k ]] && continue
+        v=${v#"${v%%[![:space:]]*}"}                      # leading whitespace
+        if [[ $v =~ ^\"([^\"]*)\" || $v =~ ^\'([^\']*)\' ]]; then
+            v=${BASH_REMATCH[1]}                            # quoted: take the inside, ignore the rest
+        else
+            [[ $v =~ ^([^#]*[^#[:space:]])?[[:space:]]+# ]] && v=${BASH_REMATCH[1]}   # trailing comment
+            v=${v%"${v##*[![:space:]]}"}                    # trailing whitespace
+        fi
+        printf -v "$k" '%s' "$v"
+    done < "$CONF"
+fi
+
+ARCHIVE=${ARCHIVE:-/mnt/frigate-archive}
+FRIGATE_MEDIA=${FRIGATE_MEDIA:-/opt/frigate/data}
+KEEP_DAYS=${KEEP_DAYS:-14}
+BWLIMIT=${BWLIMIT:-30M}
+SETTLE_MIN=${SETTLE_MIN:-2}
+RAW_WINDOW_MIN=${RAW_WINDOW_MIN:-120}
+MQTT_HOST=${MQTT_HOST:-}
+MQTT_PORT=${MQTT_PORT:-1883}
+MQTT_USER=${MQTT_USER:-}
+MQTT_PASSWORD=${MQTT_PASSWORD:-}
+MQTT_PASSWORD_FILE=${MQTT_PASSWORD_FILE:-}
+MQTT_PASSWORD_KEY=${MQTT_PASSWORD_KEY:-}
+MQTT_TOPIC=${MQTT_TOPIC:-frigate/archive/status}
+STATUS_FILE=${STATUS_FILE:-/var/lib/frigate-archive/status.json}
+LOCK_FILE=${LOCK_FILE:-/run/frigate-archive.lock}
+export FRIGATE_ARCHIVE_CONF=$CONF       # the tool reads the same file
+
+SRC=$FRIGATE_MEDIA/recordings
+DEST=$ARCHIVE/recordings
+MARKER=$ARCHIVE/.frigate-archive        # must exist in the archive: proves it's mounted, not the bare mountpoint
+
+VERBOSE=${1:-}
+log() { [[ -n $VERBOSE ]] && echo "$@" || true; }
+
+# MQTT password: inline, a file holding just the password, or KEY=value inside an env file
+if [[ -z $MQTT_PASSWORD && -n $MQTT_PASSWORD_FILE && -r $MQTT_PASSWORD_FILE ]]; then
+    if [[ -n $MQTT_PASSWORD_KEY ]]; then
+        MQTT_PASSWORD=$(grep -oP "^${MQTT_PASSWORD_KEY}=\K.*" "$MQTT_PASSWORD_FILE" || true)
+    else
+        MQTT_PASSWORD=$(head -n1 "$MQTT_PASSWORD_FILE")
+    fi
+fi
+
+publish() {   # publish <state> <message> [extra json fields]
+    local json last=0
+    json=$(printf '{"state":"%s","message":"%s","time":%d%s}' "$1" "$2" "$(date +%s)" "${3:-}")
+    mkdir -p "$(dirname "$STATUS_FILE")"
+    # keep last_success across failures so an alert can key on its age
+    [[ -f $STATUS_FILE ]] && last=$(grep -oP '"last_success":\K[0-9]+' "$STATUS_FILE" || echo 0)
+    [[ $1 == ok ]] && last=$(date +%s)
+    json="${json%\}},\"last_success\":$last}"
+    echo "$json" > "$STATUS_FILE"
+    if [[ -n $MQTT_HOST ]]; then
+        mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" ${MQTT_USER:+-u "$MQTT_USER"} ${MQTT_PASSWORD:+-P "$MQTT_PASSWORD"} \
+            -r -q 1 -t "$MQTT_TOPIC" -m "$json" || echo "warning: MQTT publish failed" >&2
+    fi
+}
+fail() { echo "frigate-archive: $1" >&2; publish error "$1"; exit 1; }
+
+exec 9>"$LOCK_FILE"
+flock -n 9 || { log "previous run still going"; exit 0; }
+
+[[ -f $MARKER ]] || fail "marker $MARKER missing (archive not mounted, or wrong filesystem?)"
+[[ -d $SRC ]]    || fail "Frigate recordings not found at $SRC (FRIGATE_MEDIA)"
+
+# 1. stage settled recent segments whose hour isn't joined yet
+list=$(mktemp); trap 'rm -f "$list"' EXIT
+(cd "$SRC" && find . -type f -name '*.mp4' -mmin +"$SETTLE_MIN" -mmin -"$RAW_WINDOW_MIN" -printf '%P\n') \
+    | "$TOOL" filter > "$list"
+log "candidates: $(wc -l < "$list")"
+# -rt (not -a): NFS root_squash/mapall would reject chown; mtimes preserved so pruning keys on recording time
+# exit 24 = source files vanished mid-run (Frigate's own retention deleted them) — expected, not a failure
+rc=0; rsync -rt --ignore-existing --bwlimit="$BWLIMIT" --files-from="$list" ${VERBOSE:+--stats} "$SRC/" "$DEST/" || rc=$?
+[[ $rc == 0 || $rc == 24 ]] || fail "rsync exited $rc"
+
+# 2. prune stale staging (hours normally leave staging when they're joined)
+if [[ -d $DEST ]]; then
+    find "$DEST" -type f -name '*.mp4' -mtime +"${KEEP_DAYS%.*}" -delete
+    find "$DEST" -type f -name '.*.mp4.*' -mmin +60 -delete     # rsync partials left by an interrupted run
+    find "$DEST" -mindepth 1 -type d -empty -delete
+fi
+
+# 3. sanity: the newest settled local segment should now be in the archive
+newest=$(sort "$list" | tail -1)
+[[ -z $newest || -f $DEST/$newest ]] || fail "newest segment $newest not found in archive after sync"
+
+# 4. join finished hours (time-boxed per run) + rebuild the page index.
+#    Staging above already protects the footage, so a failure here is reported, not fatal.
+#    The tool logs to stderr (straight to the journal) and prints its JSON summary on stdout.
+joined=$("$TOOL" consolidate | tail -1) || true
+"$TOOL" index || true
+[[ $joined == \{* ]] || joined='{"error":"consolidate crashed"}'
+
+free_gb=$(df -BG --output=avail "$ARCHIVE" | tail -1 | tr -dc 0-9)
+publish ok "synced" ",\"archive_free_gb\":$free_gb,\"newest\":\"$newest\",\"consolidate\":$joined"
+log "ok — archive free ${free_gb}G, newest $newest"

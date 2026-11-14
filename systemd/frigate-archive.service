@@ -1,0 +1,13 @@
+[Unit]
+Description=Copy Frigate recordings to the archive and keep it reviewable (frigate-archive)
+Documentation=file://@DOCDIR@/README.md
+After=network-online.target remote-fs.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=@BINDIR@/frigate-archive
+Environment=PYTHONUNBUFFERED=1
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

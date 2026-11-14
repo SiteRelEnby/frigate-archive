@@ -1,0 +1,591 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Frigate Archive</title>
+<style>
+  :root {
+    --bg: #0f1216; --panel: #171b21; --panel2: #1e232b; --line: #2a313b;
+    --text: #e6e9ee; --dim: #8b95a3; --accent: #5aa2ff;
+    --motion: #3d7fd9; --footage: #232a33; --gap: #12161b;
+    --alert: #ff5d5d; --detect: #f2b441; --head: #ffffff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  button, select, input { font: inherit; color: inherit; }
+  .wrap { padding: 12px 16px 24px; max-width: 1600px; margin: 0 auto; }
+
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin-bottom: 12px; }
+  header h1 { font-size: 16px; font-weight: 600; margin: 0 8px 0 0; letter-spacing: .02em; }
+  header h1 span { color: var(--dim); font-weight: 400; }
+  .datenav { display: flex; align-items: center; gap: 4px; }
+  .btn { background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
+    padding: 5px 10px; cursor: pointer; white-space: nowrap; }
+  .btn:hover { border-color: #3b4552; }
+  .btn:disabled { opacity: .4; cursor: default; }
+  .btn.on { background: var(--accent); border-color: var(--accent); color: #06111f; }
+  select.btn { padding-right: 6px; }
+  .spacer { flex: 1; }
+  a { color: var(--accent); text-decoration: none; }
+
+  /* timeline */
+  .timeline { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px 10px; }
+  .tl-row { display: grid; grid-template-columns: 120px 1fr; align-items: center; gap: 8px; }
+  .tl-label { color: var(--dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    cursor: pointer; padding: 2px 0; }
+  .tl-label.cur { color: var(--text); font-weight: 600; }
+  .tl-label.cur::before { content: "▸ "; color: var(--accent); }
+  canvas { display: block; width: 100%; cursor: crosshair; }
+  .axis canvas { cursor: default; }
+  .zoom { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--dim); font-size: 12px; margin-top: 6px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+
+  /* main */
+  .main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 12px; margin-top: 12px; }
+  @media (max-width: 1000px) { .main { grid-template-columns: 1fr; } }
+  .player { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .vidbox { position: relative; background: #000; aspect-ratio: 16 / 9; }
+  video { width: 100%; height: 100%; display: block; background: #000; }
+  .overlay { position: absolute; inset: 0; display: grid; place-items: center; color: var(--dim);
+    text-align: center; padding: 20px; pointer-events: none; }
+  .clock { position: absolute; left: 10px; top: 8px; background: rgba(0,0,0,.55); padding: 3px 8px;
+    border-radius: 6px; font-variant-numeric: tabular-nums; font-size: 15px; pointer-events: none; }
+  .clock small { color: var(--dim); margin-left: 6px; }
+  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 10px; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  .seg .btn { border: 0; border-radius: 0; border-right: 1px solid var(--line); }
+  .seg .btn:last-child { border-right: 0; }
+  .hint { color: var(--dim); font-size: 12px; padding: 0 10px 10px; display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; }
+  code { background: var(--panel2); border: 1px solid var(--line); border-radius: 4px; padding: 1px 6px; font-size: 12px; }
+
+  /* events */
+  .events { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; display: flex; flex-direction: column;
+    max-height: calc(100vh - 40px); min-height: 300px; }
+  .events-head { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 10px; border-bottom: 1px solid var(--line); }
+  .events-head b { margin-right: auto; font-weight: 600; }
+  .evlist { overflow-y: auto; flex: 1; }
+  .ev { display: grid; grid-template-columns: 96px 1fr; gap: 10px; padding: 8px 10px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  .ev:hover, .ev.cur { background: var(--panel2); }
+  .ev img, .ev .noimg { width: 96px; height: 54px; object-fit: cover; border-radius: 4px; background: var(--gap); }
+  .ev .t { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .ev .sev { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .ev .meta { color: var(--dim); font-size: 12px; }
+  .empty { color: var(--dim); padding: 20px; text-align: center; }
+  .tip { position: fixed; pointer-events: none; background: #000; border: 1px solid var(--line); border-radius: 6px;
+    padding: 4px 8px; font-size: 12px; white-space: nowrap; z-index: 10; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Frigate Archive <span id="keep"></span></h1>
+    <div class="datenav">
+      <button class="btn" id="prevDay" title="Previous day">◀</button>
+      <select class="btn" id="daySel"></select>
+      <button class="btn" id="nextDay" title="Next day">▶</button>
+    </div>
+    <div class="seg" id="modeSeg">
+      <button class="btn on" data-mode="footage">Footage</button>
+      <button class="btn" data-mode="timelapse" id="tlBtn">Timelapse</button>
+    </div>
+    <div class="spacer"></div>
+    <a href="../" class="btn" title="Back to Frigate (assumes this page is served under Frigate's host, e.g. /archive/)">Frigate ↗</a>
+  </header>
+
+  <section class="timeline">
+    <div class="tl-row axis"><div></div><canvas id="axis" height="18"></canvas></div>
+    <div id="rows"></div>
+    <div class="zoom">
+      <div class="tl-row axis"><div class="tl-label" id="zoomLabel">± 30 min</div><canvas id="zaxis" height="18"></canvas></div>
+      <div class="tl-row"><div class="tl-label" id="zoomCam"></div><canvas id="zrow" height="44"></canvas></div>
+    </div>
+    <div class="legend">
+      <span><i style="background:var(--footage)"></i>footage</span>
+      <span><i style="background:var(--motion)"></i>motion above usual</span>
+      <span><i style="background:var(--alert)"></i>alert</span>
+      <span><i style="background:var(--detect)"></i>detection</span>
+      <span>click a row to play · <code>space</code> play/pause · <code>←/→</code> ±10s (<code>shift</code> ±1m) · <code>[ ]</code> speed · <code>n/p</code> next/prev event</span>
+    </div>
+  </section>
+
+  <div class="main">
+    <section class="player">
+      <div class="vidbox">
+        <video id="vid" playsinline preload="auto"></video>
+        <div class="clock" id="clock" hidden></div>
+        <div class="overlay" id="overlay">Pick a time on the timeline, or an event on the right.</div>
+      </div>
+      <div class="controls">
+        <button class="btn" id="prevEv" title="Previous event (p)">⏮ event</button>
+        <button class="btn" data-skip="-300">−5m</button>
+        <button class="btn" data-skip="-30">−30s</button>
+        <button class="btn" id="playBtn" style="min-width:64px">▶ Play</button>
+        <button class="btn" data-skip="30">+30s</button>
+        <button class="btn" data-skip="300">+5m</button>
+        <button class="btn" id="nextEv" title="Next event (n)">event ⏭</button>
+        <div class="spacer"></div>
+        <div class="seg" id="speedSeg"></div>
+      </div>
+      <div class="hint">
+        <span id="srcInfo"></span>
+        <button class="btn" id="toFootage" hidden>Open footage at this moment</button>
+        <span id="clipHint"></span>
+      </div>
+    </section>
+
+    <section class="events">
+      <div class="events-head">
+        <b id="evCount">Events</b>
+        <div class="seg">
+          <button class="btn on" data-sev="alert">Alerts</button>
+          <button class="btn on" data-sev="detection">Detections</button>
+        </div>
+        <select class="btn" id="evCam"><option value="">all cameras</option></select>
+      </div>
+      <div class="evlist" id="evlist"></div>
+    </section>
+  </div>
+</div>
+<div class="tip" id="tip" hidden></div>
+
+<script>
+"use strict";
+const DATA = "data/";
+const SPEEDS = [1, 2, 4, 8, 16];
+const $ = (id) => document.getElementById(id);
+const vid = $("vid");
+
+const st = {
+  index: null, days: [], day: null, dayStart: 0, dayEnd: 0,
+  hours: new Map(),            // "cam|epoch" -> sidecar json (or null if missing)
+  cams: [], cam: null,
+  mode: "footage", speed: 1,
+  cur: null,                   // footage: {cam, hourEpoch, part}; timelapse: {cam, day, json}
+  wall: null,                  // wall-clock epoch currently shown
+  sev: new Set(["alert", "detection"]),
+};
+
+// ---------- time helpers ----------
+const pad = (n) => String(n).padStart(2, "0");
+const localDate = (ep) => { const d = new Date(ep * 1000); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
+const hms = (ep) => { const d = new Date(ep * 1000); return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`; };
+const hm = (ep) => hms(ep).slice(0, 5);
+const dayBounds = (day) => { const [y, m, d] = day.split("-").map(Number);
+  return [new Date(y, m - 1, d).getTime() / 1000, new Date(y, m - 1, d + 1).getTime() / 1000]; };
+const utcPath = (ep) => { const s = new Date(ep * 1000).toISOString(); return [s.slice(0, 10), s.slice(11, 13)]; };
+const hourOf = (ep) => ep - (ep % 3600);
+
+// ---------- data ----------
+async function getJSON(url) { const r = await fetch(url, { cache: "no-cache" }); if (!r.ok) throw new Error(`${r.status} ${url}`); return r.json(); }
+
+async function ensureHour(cam, ep) {
+  const k = `${cam}|${ep}`;
+  if (st.hours.has(k)) return st.hours.get(k);
+  const avail = st.index.cameras[cam]?.hours || [];
+  let h = null;
+  if (avail.includes(ep)) {
+    const [d, hh] = utcPath(ep);
+    try { h = await getJSON(`${DATA}hourly/${cam}/${d}/${hh}.json`); } catch (e) { console.warn(e); }
+  }
+  st.hours.set(k, h);
+  return h;
+}
+
+// flattened segments for a cam over [a, b): {start, dur, motion, objects, ep, part, off}
+function segsFor(cam, a, b) {
+  const out = [];
+  for (let ep = hourOf(a); ep < b; ep += 3600) {
+    const h = st.hours.get(`${cam}|${ep}`);
+    if (!h) continue;
+    h.parts.forEach((p, pi) => { for (const [start, off, dur, motion, objects] of p.segs)
+      if (start + dur > a && start < b) out.push({ start, dur, motion: motion || 0, objects: objects || 0, ep, pi, off }); });
+  }
+  return out.sort((x, y) => x.start - y.start);
+}
+function reviewFor(cam, a, b) {
+  const out = [];
+  for (let ep = hourOf(a); ep < b; ep += 3600) {
+    const h = st.hours.get(`${cam}|${ep}`);
+    if (h) for (const r of h.review) if (r.start < b && (r.end || r.start) >= a) out.push({ ...r, cam });
+  }
+  return out;
+}
+
+async function loadDay(day) {
+  st.day = day;
+  [st.dayStart, st.dayEnd] = dayBounds(day);
+  $("daySel").value = day;
+  const jobs = [];
+  for (const cam of st.cams) for (let ep = hourOf(st.dayStart); ep < st.dayEnd; ep += 3600) jobs.push(ensureHour(cam, ep));
+  await Promise.all(jobs);
+  updateTlButton();
+  renderAll();
+  renderEvents();
+}
+
+// ---------- canvas rendering ----------
+// Motion is drawn relative to the camera's typical level that day: some cameras (trees, noise,
+// a busy work area) report motion constantly, which would otherwise saturate the whole row.
+const motionScale = new Map();     // cam|day -> [baseline (median), top (p99)]
+function mscale(cam) {
+  const k = `${cam}|${st.day}`;
+  if (motionScale.has(k)) return motionScale.get(k);
+  const v = segsFor(cam, st.dayStart, st.dayEnd).map((s) => s.motion).sort((a, b) => a - b);
+  const q = (f) => (v.length ? v[Math.min(v.length - 1, Math.floor(v.length * f))] : 0);
+  const r = [q(0.5), Math.max(q(0.99), q(0.5) + 1)];
+  motionScale.set(k, r);
+  return r;
+}
+
+function prep(cv) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.height_css || (cv.height_css = cv.height);
+  cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+  cv.style.height = h + "px";
+  const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return [g, w, h];
+}
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+
+function drawAxis(cv, a, b, stepSec) {
+  const [g, w, h] = prep(cv);
+  g.fillStyle = css("--dim"); g.font = "11px system-ui, sans-serif"; g.textBaseline = "middle";
+  const first = Math.ceil(a / stepSec) * stepSec;
+  for (let t = first; t <= b; t += stepSec) {
+    const x = ((t - a) / (b - a)) * w;
+    g.fillRect(x, h - 4, 1, 4);
+    const label = stepSec >= 3600 ? pad(new Date(t * 1000).getHours()) : hm(t);
+    if (x < w - 14) g.fillText(label, x + 3, h / 2 - 1);
+  }
+}
+
+function drawRow(cv, cam, a, b, big) {
+  const [g, w, h] = prep(cv);
+  const X = (t) => ((t - a) / (b - a)) * w;
+  g.fillStyle = css("--gap"); g.fillRect(0, 0, w, h);
+  const segs = segsFor(cam, a, b);
+  const [base, top99] = mscale(cam);
+  const top = big ? 12 : 6;
+  // footage + motion, aggregated per pixel
+  const motion = new Float32Array(Math.ceil(w) + 1), have = new Uint8Array(Math.ceil(w) + 1);
+  for (const s of segs) {
+    const x0 = Math.max(0, Math.floor(X(s.start))), x1 = Math.min(w, Math.ceil(X(s.start + s.dur)));
+    for (let x = x0; x <= x1; x++) { have[x] = 1; motion[x] = Math.max(motion[x], s.motion); }
+  }
+  g.fillStyle = css("--footage");
+  for (let x = 0; x <= w; x++) if (have[x]) g.fillRect(x, top, 1, h - top);
+  g.fillStyle = css("--motion");
+  for (let x = 0; x <= w; x++) if (motion[x] > base) {
+    const f = Math.min(1, (motion[x] - base) / (top99 - base)), bh = Math.max(1, f * (h - top));
+    g.fillRect(x, h - bh, 1, bh);
+  }
+  // review items as bands across the top
+  for (const r of reviewFor(cam, a, b)) {
+    if (!st.sev.has(r.severity)) continue;
+    const x0 = X(r.start), x1 = Math.max(x0 + 2, X(r.end || r.start + 5));
+    g.fillStyle = r.severity === "alert" ? css("--alert") : css("--detect");
+    g.fillRect(x0, 0, x1 - x0, top - 2);
+    if (big && x1 - x0 > 40) { g.fillStyle = "#000"; g.font = "10px system-ui"; g.textBaseline = "top";
+      g.fillText(r.objects.join(","), x0 + 3, 0, x1 - x0 - 4); }
+  }
+  // playhead
+  if (st.wall && st.cur && st.cur.cam === cam && st.wall >= a && st.wall <= b) {
+    g.fillStyle = css("--head"); g.fillRect(X(st.wall) - 1, 0, 2, h);
+  }
+}
+
+function zoomWindow() {
+  const c = st.wall || (st.dayStart + st.dayEnd) / 2;
+  return [c - 1800, c + 1800];
+}
+
+function renderAll() {
+  drawAxis($("axis"), st.dayStart, st.dayEnd, 3600);
+  for (const cam of st.cams) drawRow($(`row-${cam}`), cam, st.dayStart, st.dayEnd, false);
+  const [za, zb] = zoomWindow();
+  const zc = st.cur?.cam || st.cam;
+  $("zoomCam").textContent = zc || "";
+  drawAxis($("zaxis"), za, zb, 300);
+  if (zc) drawRow($("zrow"), zc, za, zb, true);
+  document.querySelectorAll(".tl-label[data-cam]").forEach((el) => el.classList.toggle("cur", el.dataset.cam === zc));
+}
+
+function buildRows() {
+  const rows = $("rows"); rows.innerHTML = "";
+  for (const cam of st.cams) {
+    const r = document.createElement("div"); r.className = "tl-row";
+    r.innerHTML = `<div class="tl-label" data-cam="${cam}" title="${cam}">${cam}</div><canvas id="row-${cam}" height="26"></canvas>`;
+    rows.appendChild(r);
+    const cv = r.querySelector("canvas");
+    hookCanvas(cv, () => [st.dayStart, st.dayEnd], cam);
+    r.querySelector(".tl-label").onclick = () => { st.cam = cam; updateTlButton(); renderAll(); };
+  }
+  hookCanvas($("zrow"), zoomWindow, null);
+}
+
+function hookCanvas(cv, win, camFixed) {
+  const tAt = (e) => { const [a, b] = win(); const r = cv.getBoundingClientRect(); return a + ((e.clientX - r.left) / r.width) * (b - a); };
+  cv.addEventListener("mousemove", (e) => {
+    const t = tAt(e), cam = camFixed || st.cur?.cam || st.cam;
+    const ev = reviewFor(cam, t - 60, t + 60).find((r) => st.sev.has(r.severity) && t >= r.start - 30 && t <= (r.end || r.start) + 30);
+    const tip = $("tip"); tip.hidden = false;
+    tip.textContent = `${camFixed ? "" : cam + " · "}${hms(t)}${ev ? ` · ${ev.severity}: ${ev.objects.join(", ")}` : ""}`;
+    tip.style.left = Math.min(e.clientX + 12, innerWidth - tip.offsetWidth - 8) + "px"; tip.style.top = e.clientY + 16 + "px";
+  });
+  cv.addEventListener("mouseleave", () => { $("tip").hidden = true; });
+  cv.addEventListener("click", (e) => {
+    const t = tAt(e), cam = camFixed || st.cur?.cam || st.cam;
+    if (camFixed) st.cam = camFixed;
+    if (st.mode === "timelapse" && st.cur?.cam === cam) seekTimelapse(t); else playAt(cam, t);
+  });
+}
+
+// ---------- footage playback ----------
+function partURL(cam, ep, pi) {
+  const h = st.hours.get(`${cam}|${ep}`); const [d] = utcPath(ep);
+  return `${DATA}hourly/${cam}/${d}/${h.parts[pi].file}`;
+}
+
+async function findSeg(cam, t) {
+  // segment covering t, else the next one after t (looking up to 24h ahead)
+  for (let ep = hourOf(t); ep < t + 86400; ep += 3600) {
+    await ensureHour(cam, ep);
+    const s = segsFor(cam, ep, ep + 3600).find((s) => s.start + s.dur > t);
+    if (s) return s;
+  }
+  return null;
+}
+
+async function playAt(cam, t, autoplay = true) {
+  setMode("footage", false);
+  st.cam = cam;
+  const s = await findSeg(cam, t);
+  if (!s) { showOverlay(`No archived footage for ${cam} after ${hms(t)}.`); return; }
+  const off = s.off + Math.max(0, t - s.start);
+  const url = partURL(cam, s.ep, s.pi);
+  st.cur = { cam, ep: s.ep, pi: s.pi };
+  st.wall = Math.max(t, s.start);
+  showOverlay(null);
+  if (vid.dataset.src !== url) {
+    vid.dataset.src = url; vid.src = url;
+    await new Promise((res) => vid.addEventListener("loadedmetadata", res, { once: true }));
+  }
+  vid.currentTime = off;
+  vid.playbackRate = st.speed;
+  if (autoplay) vid.play().catch(() => {});
+  if (localDate(t) !== st.day && st.days.includes(localDate(t))) await loadDay(localDate(t));
+  updateSrcInfo();
+}
+
+function curSegs() {
+  if (!st.cur || st.mode !== "footage") return null;
+  const h = st.hours.get(`${st.cur.cam}|${st.cur.ep}`);
+  return h ? h.parts[st.cur.pi].segs : null;
+}
+function wallFromVideo() {
+  const segs = curSegs(); if (!segs) return null;
+  const t = vid.currentTime;
+  let lo = 0, hi = segs.length - 1;
+  while (lo < hi) { const m = (lo + hi + 1) >> 1; if (segs[m][1] <= t) lo = m; else hi = m - 1; }
+  const [start, off, dur] = segs[lo];
+  return start + Math.min(t - off, dur);
+}
+
+async function nextPart() {
+  const segs = curSegs(); if (!segs) return;
+  const [start, , dur] = segs[segs.length - 1];
+  await playAt(st.cur.cam, start + dur + 0.01);
+}
+
+// ---------- timelapse ----------
+function tlAvailable(cam, day) { return (st.index.cameras[cam]?.timelapse || []).includes(day); }
+function updateTlButton() {
+  const cam = st.cur?.cam || st.cam;
+  $("tlBtn").disabled = !(cam && tlAvailable(cam, st.day));
+  $("tlBtn").title = $("tlBtn").disabled ? `No timelapse for ${cam || "this camera"} on ${st.day}` : `${cam} timelapse for ${st.day}`;
+}
+
+async function startTimelapse() {
+  const cam = st.cur?.cam || st.cam;
+  if (!cam || !tlAvailable(cam, st.day)) return;
+  const json = await getJSON(`${DATA}timelapse/${cam}/${st.day}.json`);
+  st.cur = { cam, day: st.day, tl: json };
+  const url = `${DATA}timelapse/${cam}/${st.day}.mp4`;
+  showOverlay(null);
+  vid.dataset.src = url; vid.src = url;
+  await new Promise((res) => vid.addEventListener("loadedmetadata", res, { once: true }));
+  if (st.wall) seekTimelapse(st.wall, false);
+  vid.playbackRate = st.speed;
+  vid.play().catch(() => {});
+  updateSrcInfo();
+}
+
+function seekTimelapse(t, keepPlaying = true) {
+  const f = st.cur?.tl?.frames; if (!f) return;
+  let lo = 0, hi = f.length - 1;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (f[m] < t) lo = m + 1; else hi = m; }
+  vid.currentTime = (lo + 0.5) / st.cur.tl.fps;
+  st.wall = f[lo];
+}
+function wallFromTimelapse() {
+  const tl = st.cur?.tl; if (!tl) return null;
+  return tl.frames[Math.min(tl.frames.length - 1, Math.max(0, Math.floor(vid.currentTime * tl.fps)))];
+}
+
+function setMode(mode, act = true) {
+  if (mode === "timelapse" && $("tlBtn").disabled) return;
+  const changed = st.mode !== mode;
+  st.mode = mode;
+  document.querySelectorAll("#modeSeg .btn").forEach((b) => b.classList.toggle("on", b.dataset.mode === mode));
+  $("toFootage").hidden = mode !== "timelapse";
+  if (!act || !changed) return;
+  if (mode === "timelapse") startTimelapse();
+  else if (st.wall) playAt(st.cur?.cam || st.cam, st.wall);
+}
+
+// ---------- events list ----------
+function dayEvents() {
+  const camFilter = $("evCam").value;
+  const all = [];
+  for (const cam of st.cams) if (!camFilter || camFilter === cam) all.push(...reviewFor(cam, st.dayStart, st.dayEnd));
+  return all.filter((r) => st.sev.has(r.severity) && r.start >= st.dayStart && r.start < st.dayEnd).sort((a, b) => a.start - b.start);
+}
+
+function renderEvents() {
+  const evs = dayEvents();
+  $("evCount").textContent = `${evs.length} event${evs.length === 1 ? "" : "s"}`;
+  const list = $("evlist");
+  if (!evs.length) { list.innerHTML = `<div class="empty">No archived events for this day.</div>`; return; }
+  list.innerHTML = "";
+  for (const r of evs) {
+    const el = document.createElement("div"); el.className = "ev"; el.dataset.id = r.id;
+    const img = r.thumb ? `<img loading="lazy" src="${DATA}thumbs/${r.cam}/${r.id}.webp" alt="">` : `<div class="noimg"></div>`;
+    const color = r.severity === "alert" ? "var(--alert)" : "var(--detect)";
+    const len = r.end ? `${Math.round(r.end - r.start)}s` : "";
+    const who = (r.sub_labels || []).filter(Boolean).join(", ");
+    el.innerHTML = `${img}<div><div class="t"><span class="sev" style="background:${color}"></span>${hms(r.start)}
+      <span class="meta">${len}</span></div><div>${r.cam} · ${r.objects.join(", ") || "—"}${who ? ` (${who})` : ""}</div>
+      <div class="meta">${(r.zones || []).join(", ")}</div></div>`;
+    el.onclick = () => { st.cam = r.cam; playAt(r.cam, r.start - 3); };
+    list.appendChild(el);
+  }
+}
+
+function jumpEvent(dir) {
+  const evs = dayEvents().filter((r) => !st.cur || r.cam === st.cur.cam);
+  const t = st.wall ?? st.dayStart;
+  const r = dir > 0 ? evs.find((e) => e.start - 3 > t + 1) : [...evs].reverse().find((e) => e.start - 3 < t - 2);
+  if (r) playAt(r.cam, r.start - 3);
+}
+
+// ---------- UI glue ----------
+function showOverlay(msg) { $("overlay").hidden = !msg; if (msg) $("overlay").textContent = msg; }
+
+function updateSrcInfo() {
+  if (!st.cur) return;
+  if (st.mode === "timelapse") {
+    const tl = st.cur.tl;
+    $("srcInfo").innerHTML = `${st.cur.cam} timelapse · 1 frame / ${tl.interval}s · <a href="${vid.dataset.src}" download>download</a>`;
+  } else {
+    const h = st.hours.get(`${st.cur.cam}|${st.cur.ep}`), p = h.parts[st.cur.pi];
+    $("srcInfo").innerHTML = `${st.cur.cam} · ${p.codec.toUpperCase()} ${p.w}×${p.h} · <a href="${vid.dataset.src}" download>download hour</a>`;
+  }
+}
+
+let lastDraw = 0;
+function tick() {
+  const w = st.mode === "timelapse" ? wallFromTimelapse() : wallFromVideo();
+  if (w == null) return;
+  st.wall = w;
+  const c = $("clock"); c.hidden = false;
+  c.innerHTML = `${hms(w)}<small>${localDate(w)} · ${st.cur.cam}${st.mode === "timelapse" ? " · timelapse" : ""}${st.speed > 1 ? ` · ${st.speed}×` : ""}</small>`;
+  $("clipHint").innerHTML = `clip: <code>frigate-clip ${st.cur.cam} "${localDate(w)} ${hm(w)}" 10m</code>`;
+  const now = performance.now();
+  if (now - lastDraw > 250) { lastDraw = now; renderAll(); highlightEvent(w); }
+}
+
+function highlightEvent(w) {
+  document.querySelectorAll(".ev.cur").forEach((e) => e.classList.remove("cur"));
+  const r = dayEvents().find((r) => r.cam === st.cur?.cam && w >= r.start - 3 && w <= (r.end || r.start) + 3);
+  if (r) document.querySelector(`.ev[data-id="${CSS.escape(r.id)}"]`)?.classList.add("cur");
+}
+
+function setSpeed(s) {
+  st.speed = s; vid.playbackRate = s;
+  document.querySelectorAll("#speedSeg .btn").forEach((b) => b.classList.toggle("on", +b.dataset.speed === s));
+}
+
+function skip(sec) {
+  if (!st.cur || st.wall == null) return;
+  if (st.mode === "timelapse") seekTimelapse(st.wall + sec * 20);   // timelapse: skip proportionally further
+  else playAt(st.cur.cam, st.wall + sec, !vid.paused);
+}
+
+function wire() {
+  $("prevDay").onclick = () => { const i = st.days.indexOf(st.day); if (i > 0) loadDay(st.days[i - 1]); };
+  $("nextDay").onclick = () => { const i = st.days.indexOf(st.day); if (i < st.days.length - 1) loadDay(st.days[i + 1]); };
+  $("daySel").onchange = (e) => loadDay(e.target.value);
+  document.querySelectorAll("#modeSeg .btn").forEach((b) => (b.onclick = () => setMode(b.dataset.mode)));
+  $("toFootage").onclick = () => setMode("footage");
+  $("playBtn").onclick = () => (vid.paused ? vid.play() : vid.pause());
+  document.querySelectorAll("[data-skip]").forEach((b) => (b.onclick = () => skip(+b.dataset.skip)));
+  $("prevEv").onclick = () => jumpEvent(-1);
+  $("nextEv").onclick = () => jumpEvent(1);
+  const sp = $("speedSeg");
+  for (const s of SPEEDS) { const b = document.createElement("button"); b.className = "btn"; b.dataset.speed = s; b.textContent = s + "×"; b.onclick = () => setSpeed(s); sp.appendChild(b); }
+  setSpeed(1);
+  document.querySelectorAll("[data-sev]").forEach((b) => (b.onclick = () => {
+    st.sev.has(b.dataset.sev) ? st.sev.delete(b.dataset.sev) : st.sev.add(b.dataset.sev);
+    b.classList.toggle("on"); renderEvents(); renderAll(); }));
+  $("evCam").onchange = renderEvents;
+
+  vid.addEventListener("timeupdate", tick);
+  vid.addEventListener("seeked", tick);
+  vid.addEventListener("play", () => ($("playBtn").textContent = "❚❚ Pause"));
+  vid.addEventListener("pause", () => ($("playBtn").textContent = "▶ Play"));
+  vid.addEventListener("ended", () => { if (st.mode === "footage") nextPart(); });
+  vid.addEventListener("error", () => {
+    const hevc = st.mode === "footage" && st.cur && st.hours.get(`${st.cur.cam}|${st.cur.ep}`)?.parts[st.cur.pi].codec === "hevc";
+    showOverlay(hevc ? "This browser can't play HEVC (H.265). Chrome/Edge with hardware decoding or Safari can — or use the download link."
+                     : "Couldn't load this video.");
+  });
+  addEventListener("resize", renderAll);
+  addEventListener("keydown", (e) => {
+    if (e.target.matches("input, select")) return;
+    const k = e.key;
+    if (k === " ") { e.preventDefault(); vid.paused ? vid.play() : vid.pause(); }
+    else if (k === "ArrowRight") skip(e.shiftKey ? 60 : 10);
+    else if (k === "ArrowLeft") skip(e.shiftKey ? -60 : -10);
+    else if (k === "]") setSpeed(SPEEDS[Math.min(SPEEDS.length - 1, SPEEDS.indexOf(st.speed) + 1)]);
+    else if (k === "[") setSpeed(SPEEDS[Math.max(0, SPEEDS.indexOf(st.speed) - 1)]);
+    else if (k === "n") jumpEvent(1);
+    else if (k === "p") jumpEvent(-1);
+    else return;
+  });
+}
+
+async function init() {
+  wire();
+  try { st.index = await getJSON(`${DATA}index.json`); }
+  catch (e) { showOverlay("Couldn't load the archive index — is the NFS share mounted?"); return; }
+  st.cams = Object.keys(st.index.cameras).sort();
+  $("keep").textContent = `· ${st.index.keep_days} days`;
+  for (const c of st.cams) $("evCam").insertAdjacentHTML("beforeend", `<option>${c}</option>`);
+  const days = new Set();
+  for (const c of st.cams) for (const ep of st.index.cameras[c].hours) { days.add(localDate(ep)); days.add(localDate(ep + 3599)); }
+  st.days = [...days].sort();
+  $("daySel").innerHTML = st.days.slice().reverse().map((d) =>
+    `<option value="${d}">${new Date(d + "T12:00").toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })}</option>`).join("");
+  // start on a camera that has timelapses (usually the one you care about), else the first
+  st.cam = st.cams.find((c) => st.index.cameras[c].timelapse.length) || st.cams[0];
+  buildRows();
+  if (!st.days.length) { showOverlay("Nothing archived yet — hours appear here about 15–25 minutes after they end."); return; }
+  await loadDay(st.days[st.days.length - 1]);
+}
+init();
+</script>
+</body>
+</html>

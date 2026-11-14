@@ -1,0 +1,11 @@
+[Unit]
+Description=Build yesterday's Frigate archive timelapses (frigate-archive-tool timelapse)
+Documentation=file://@DOCDIR@/README.md
+After=network-online.target remote-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=@BINDIR@/frigate-archive-tool timelapse
+Environment=PYTHONUNBUFFERED=1
+Nice=15
+IOSchedulingClass=idle
