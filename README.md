@@ -2,6 +2,8 @@
 
 An archive for recordings from [Frigate](https://frigate.video) NVR recordings, for long-term off-server archiving to save on disk space, while still keeping recordings easily reviewable and exportable.
 
+![The review page: per-camera day timelines with motion, alerts and detections, a ±30 min zoom strip, the player, and the event list](docs/screenshot.png)
+
 Frigate stores recordings on its own disk, and continuous recording from a few cameras fills
 a small disk in days. frigate-archive lets you keep only a short window locally (say 12 hours)
 and moves everything to an archive filesystem (NFS, SMB, a second disk). There it becomes:
