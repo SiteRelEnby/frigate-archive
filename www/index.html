@@ -12,6 +12,7 @@
     --alert: #ff5d5d; --detect: #f2b441; --head: #ffffff;
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }   /* class display rules (.overlay grid, .btn) would otherwise beat it */
   html, body { margin: 0; background: var(--bg); color: var(--text);
     font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
   button, select, input { font: inherit; color: inherit; }
