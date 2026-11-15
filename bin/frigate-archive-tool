@@ -14,6 +14,9 @@ Nightly (frigate-timelapse.timer):
 Manual:
   clip <camera> <start> <duration> [out]   e.g.  clip garden "2026-10-21 14:00" 45m
                                            (also installed as `frigate-clip`)
+  export --cams a,b --start T (--end T | --duration D) [--x265 [--crf N] [--height H]]
+                 one file per camera into exports/<id>/ (also what the page's Export runs)
+  serve          export API for the review page (frigate-archive-export.service)
   harvest        save Frigate metadata for not-yet-joined hours (run before cutting
                  Frigate's local retention)
   check          validate config and dependencies
@@ -28,6 +31,7 @@ Archive layout (UTC dates/hours, same as Frigate's recordings dir):
   thumbs/<cam>/<review-id>.webp
   timelapse/<cam>/<local-date>.mp4|.json
   clips/                                   output of `clip`
+  exports/<id>/job.json, *.mp4             exports (page or `export`), kept EXPORT_KEEP_DAYS
   index.json
 """
 import argparse
@@ -72,6 +76,11 @@ DEFAULTS = {
     "MQTT_TOPIC": "frigate/archive/status",
     "STATUS_FILE": "/var/lib/frigate-archive/status.json",
     "LOCK_FILE": "/run/frigate-archive.lock",
+    # export (the review page's Export panel talks to `serve`)
+    "EXPORT_LISTEN": "127.0.0.1:8597",
+    "EXPORT_KEEP_DAYS": "7",
+    "EXPORT_MAX_HOURS": "24",
+    "EXPORT_THREADS": "",
 }
 CONF_PATH = os.environ.get("FRIGATE_ARCHIVE_CONF", "/etc/frigate-archive/frigate-archive.conf")
 
@@ -119,6 +128,7 @@ RAW = ARCHIVE / "recordings"
 HOURLY = ARCHIVE / "hourly"
 THUMBS = ARCHIVE / "thumbs"
 TIMELAPSE = ARCHIVE / "timelapse"
+EXPORTS = ARCHIVE / "exports"
 META = ARCHIVE / ".meta"        # harvested Frigate metadata for hours not yet joined (see harvest)
 MARKER = ARCHIVE / ".frigate-archive"
 TMP = None                      # per-process scratch dir, created in main()
@@ -459,6 +469,7 @@ def cmd_index(_args):
     for c in cams.values():
         c.setdefault("hours", [])
         c.setdefault("timelapse", [])
+    prune_exports()
     write_json(ARCHIVE / "index.json", {"generated": int(time.time()), "keep_days": KEEP_DAYS,
                                         "cameras": cams})
 
@@ -540,6 +551,8 @@ def cmd_timelapse(args):
 # --- clip --------------------------------------------------------------------
 
 def parse_when(s):
+    if re.fullmatch(r"@\d+", s):                       # @epoch, unambiguous (DST changeovers)
+        return int(s[1:])
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%H:%M:%S", "%H:%M"):
         try:
             t = dt.datetime.strptime(s, fmt)
@@ -600,6 +613,420 @@ def cmd_clip(args):
         print(dest)
 
 
+# --- export ------------------------------------------------------------------
+#
+# One video file per camera for a time range, optionally re-encoded to H.265 (x265).
+# Jobs live in <ARCHIVE>/exports/<id>/ (job.json + the finished files), so the review page can
+# list and download them; `serve` runs queued jobs one at a time, `export` runs one directly.
+
+JOB_ID_RE = re.compile(r"\d{8}-\d{6}-[0-9a-f]{4}")
+CAM_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+CRFS = range(18, 41)
+HEIGHTS = (480, 720, 1080, 1440)
+
+
+def known_cameras():
+    cams = {d.name for d in HOURLY.glob("*") if d.is_dir()} if HOURLY.is_dir() else set()
+    for root in (SRC, RAW):
+        if root.is_dir():
+            cams |= {d.name for d in root.glob("[0-9]*-*-*/[0-2][0-9]/*") if d.is_dir()}
+    return cams
+
+
+def job_path(jid):
+    return EXPORTS / jid / "job.json"
+
+
+def load_job(jid):
+    try:
+        return json.loads(job_path(jid).read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def save_job(job):
+    (EXPORTS / job["id"]).mkdir(parents=True, exist_ok=True)
+    write_json(job_path(job["id"]), job)
+
+
+def new_job(cams, s, e, encode="copy", crf=30, height=None, state="queued"):
+    jid = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.urandom(2).hex()}"
+    job = {"id": jid, "created": int(time.time()), "cameras": cams, "start": s, "end": e,
+           "encode": encode, "crf": crf, "height": height, "state": state, "progress": 0,
+           "message": "", "files": []}
+    save_job(job)
+    return job
+
+
+def dur_label(sec):
+    h, m, s = sec // 3600, sec % 3600 // 60, sec % 60
+    return "".join(f"{v}{u}" for v, u in ((h, "h"), (m, "m"), (s, "s")) if v) or "0s"
+
+
+def export_pieces(cam, s, e):
+    """Footage of cam overlapping [s, e) in time order: [(path, file_dur, a, b, sig)], where a..b is
+    the wanted span as offsets into the file. Joined hours come from hourly/, hours not joined yet
+    from raw segments (local first, then staged), so an export can reach up to a few minutes ago."""
+    out = []
+    for ep in range(s - s % 3600, e, 3600):
+        date, hh = utc_parts(ep)
+        h = load_hour(cam, ep)
+        if h:
+            for part in h["parts"]:
+                hits = [(max(st, s) - st + off, min(st + du, e) - st + off)
+                        for st, off, du, *_ in part["segs"] if st < e and st + du > s]
+                if not hits:
+                    continue
+                path = HOURLY / cam / date / part["file"]
+                sig, fdur = ffprobe(path)
+                if sig and fdur:
+                    out.append((path, fdur, hits[0][0], min(hits[-1][1], fdur), sig))
+            continue
+        files = {}
+        for root in (RAW, SRC):                        # local copy wins over staged
+            for f in (root / date / hh / cam).glob("*.mp4"):
+                if re.fullmatch(r"\d\d\.\d\d\.mp4", f.name):
+                    files[f.name] = f
+        for name in sorted(files):
+            st = ep + int(name[:2]) * 60 + int(name[3:5])
+            if st >= e or st + MAX_SEG <= s:
+                continue
+            sig, du = ffprobe(files[name])
+            if not sig or not du or not 0 < du < MAX_SEG or st + du <= s:
+                continue
+            out.append((files[name], du, max(0.0, s - st), min(du, e - st), sig))
+    return out
+
+
+def ffmpeg_progress(args, on_time):
+    """Run ffmpeg, calling on_time(seconds_of_output) as it goes."""
+    err = TMP / "ffmpeg.err"
+    with open(err, "w") as ef:
+        p = subprocess.Popen(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                              "-progress", "pipe:1", "-nostats", *args],
+                             stdout=subprocess.PIPE, stderr=ef, text=True)
+        for line in p.stdout:
+            if line.startswith("out_time_us="):
+                v = line.split("=", 1)[1].strip()
+                if v.lstrip("-").isdigit():
+                    on_time(max(0, int(v)) / 1e6)
+        rc = p.wait()
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg failed ({rc}): {err.read_text().strip()[-500:]}")
+
+
+def run_export(job):
+    s, e, enc = job["start"], job["end"], job["encode"]
+    stamp = dt.datetime.fromtimestamp(s).strftime("%Y%m%d-%H%M%S")
+    outdir = EXPORTS / job["id"]
+
+    plan = {}                                          # cam -> list of groups (consecutive same-sig pieces)
+    for cam in job["cameras"]:
+        groups = []
+        for p in export_pieces(cam, s, e):
+            if not groups or groups[-1][-1][4] != p[4]:
+                groups.append([])
+            groups[-1].append(p)
+        plan[cam] = [g for g in groups if group_len(g) >= 1]
+    total = sum(group_len(g) for gs in plan.values() for g in gs)
+    if not total:
+        raise RuntimeError("no archived footage for those cameras in that range")
+
+    done, last_save = 0.0, 0.0
+
+    def progress(t):
+        nonlocal last_save
+        if time.time() - last_save > 2:
+            job["progress"] = round(min(0.999, (done + t) / total), 4)
+            save_job(job)
+            last_save = time.time()
+
+    notes = []
+    for cam, groups in plan.items():
+        if not groups:
+            notes.append(f"{cam}: no footage")
+            continue
+        job["message"] = f"exporting {cam}"
+        save_job(job)
+        base = f"{cam}_{stamp}_{dur_label(e - s)}"
+        if enc == "copy":
+            # stream copy can't splice different codecs/resolutions: one file per run of the same kind
+            for k, g in enumerate(groups):
+                name = f"{base}.mp4" if k == 0 else f"{base}.p{k + 1}.mp4"
+                tmp = outdir / f".{name}.part"
+                ffmpeg_progress([*concat_input(g), "-map", "0:v", "-map", "0:a?", "-c", "copy",
+                                 *(["-tag:v", "hvc1"] if g[0][4][0] == "hevc" else []),
+                                 "-movflags", "+faststart", "-f", "mp4", str(tmp)], progress)
+                os.replace(tmp, outdir / name)
+                done += group_len(g)
+                add_file(job, cam, outdir / name, group_len(g))
+            if len(groups) > 1:
+                notes.append(f"{cam}: {len(groups)} parts (camera changed codec/resolution; "
+                             "pick H.265 to get one file)")
+        else:
+            # re-encode every run to the same size/codec/audio layout, then splice them losslessly
+            tallest = max(groups, key=lambda g: g[0][4][2])[0][4]
+            h = min(job["height"] or tallest[2], tallest[2])
+            h -= h % 2
+            w = round(tallest[1] * h / tallest[2] / 2) * 2
+            audio = any(g[0][4][3] for g in groups)
+            pools = CONF["EXPORT_THREADS"]
+            chunks = []
+            for k, g in enumerate(groups):
+                chunk = outdir / f".{base}.c{k}.mp4"
+                silent = audio and not g[0][4][3]
+                ffmpeg_progress([
+                    *concat_input(g),
+                    *(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono"] if silent else []),
+                    "-map", "0:v", *(["-map", "1:a" if silent else "0:a"] if audio else []),
+                    "-vf", f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                           f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p",
+                    "-c:v", "libx265", "-preset", "medium", "-crf", str(job["crf"]),
+                    "-x265-params", "log-level=error" + (f":pools={pools}" if pools else ""),
+                    "-tag:v", "hvc1",
+                    *(["-c:a", "aac", "-b:a", "64k", "-ar", "48000", "-ac", "1"] if audio else []),
+                    *(["-shortest"] if silent else []),
+                    "-f", "mp4", str(chunk)],
+                    progress)
+                chunks.append(chunk)
+                done += group_len(g)
+            name = f"{base}.mp4"
+            tmp = outdir / f".{name}.part"
+            lst = TMP / "chunks.txt"
+            lst.write_text("ffconcat version 1.0\n" + "".join(f"file '{c}'\n" for c in chunks))
+            ffmpeg("-f", "concat", "-safe", "0", "-i", str(lst), "-map", "0", "-c", "copy", "-tag:v", "hvc1",
+                   "-movflags", "+faststart", "-f", "mp4", str(tmp))
+            os.replace(tmp, outdir / name)
+            for c in chunks:
+                c.unlink(missing_ok=True)
+            add_file(job, cam, outdir / name, sum(group_len(g) for g in groups))
+    job["message"] = "; ".join(notes)
+
+
+def group_len(g):
+    """Seconds of footage a run of pieces yields: the first is cut at a, the last at b."""
+    if len(g) == 1:
+        return g[0][3] - g[0][2]
+    return (g[0][1] - g[0][2]) + sum(p[1] for p in g[1:-1]) + g[-1][3]
+
+
+def concat_input(g):
+    """ffmpeg input args for a run of pieces: concat the whole files (durations pinned, as in join),
+    then seek into the first and stop after the run's length."""
+    lst = TMP / f"export-{os.urandom(3).hex()}.txt"
+    lst.write_text("ffconcat version 1.0\n" + "".join(
+        f"file '{p[0]}'\noutpoint {p[1]:.3f}\nduration {p[1]:.3f}\n" for p in g))
+    return ["-ss", f"{g[0][2]:.3f}", "-t", f"{group_len(g):.3f}", "-f", "concat", "-safe", "0", "-i", str(lst)]
+
+
+def add_file(job, cam, path, secs):
+    job["files"].append({"camera": cam, "file": path.name, "size": path.stat().st_size, "duration": round(secs)})
+    save_job(job)
+
+
+def cmd_export(args):
+    if args.job:
+        job = load_job(args.job) if JOB_ID_RE.fullmatch(args.job) else None
+        if not job:
+            sys.exit(f"no such export job {args.job}")
+    else:
+        if not (args.cams and args.start and (args.end or args.duration)):
+            sys.exit("export: need --cams, --start and --end or --duration (or --job ID)")
+        s = parse_when(args.start)
+        e = parse_when(args.end) if args.end else s + parse_dur(args.duration)
+        cams = [c for c in re.split(r"[\s,]+", args.cams) if c]
+        job = new_job(cams, s, e, "x265" if args.x265 else "copy", args.crf, args.height, state="running")
+    for f in (EXPORTS / job["id"]).glob(".*"):        # leftovers of an interrupted attempt
+        f.unlink()
+    job.update(state="running", progress=0, files=[], message="", pid=os.getpid(), started=int(time.time()))
+    save_job(job)
+
+    def stop(_sig, _frm):
+        raise KeyboardInterrupt
+    import signal
+    signal.signal(signal.SIGTERM, stop)
+    try:
+        run_export(job)
+        job.update(state="done", progress=1)
+    except KeyboardInterrupt:
+        job.update(state="cancelled", message="cancelled")
+    except Exception as ex:                            # noqa: BLE001 — report anything to the page
+        job.update(state="failed", message=str(ex)[-500:])
+        log(f"export {job['id']} failed: {ex}")
+    finally:
+        for f in (EXPORTS / job["id"]).glob(".*"):
+            f.unlink(missing_ok=True)
+        job["finished"] = int(time.time())
+        job.pop("pid", None)
+        save_job(job)
+    for f in job["files"]:
+        print(EXPORTS / job["id"] / f["file"])
+    if job["message"]:
+        log(job["message"])
+    return 0 if job["state"] == "done" else 1
+
+
+def list_jobs():
+    jobs = []
+    for d in EXPORTS.glob("*") if EXPORTS.is_dir() else []:
+        if JOB_ID_RE.fullmatch(d.name):
+            j = load_job(d.name)
+            if j:
+                jobs.append(j)
+    return sorted(jobs, key=lambda j: j["id"], reverse=True)
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, TypeError):
+        return False
+
+
+def prune_exports():
+    cutoff = time.time() - float(CONF["EXPORT_KEEP_DAYS"]) * 86400
+    for j in list_jobs():
+        if j["state"] not in ("queued", "running") and j.get("finished", j["created"]) < cutoff:
+            shutil.rmtree(EXPORTS / j["id"], ignore_errors=True)
+
+
+def cmd_serve(_args):
+    """Small JSON API for the review page's Export panel. Listens on localhost only and has no
+    auth of its own: put it behind the same nginx auth_request as the page (contrib/nginx-archive.conf)."""
+    import signal
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    tool = str(Path(__file__).resolve())
+    lock = threading.Lock()
+    cur = {"proc": None, "id": None}
+    max_sec = float(CONF["EXPORT_MAX_HOURS"]) * 3600
+
+    EXPORTS.mkdir(parents=True, exist_ok=True)
+    for j in list_jobs():                              # interrupted by a restart: run them again
+        if j["state"] == "running" and not pid_alive(j.get("pid")):
+            j.update(state="queued", progress=0, message="restarted")
+            save_job(j)
+
+    def worker():
+        while True:
+            with lock:
+                p = cur["proc"]
+                if p and p.poll() is not None:
+                    j = load_job(cur["id"])
+                    if j and j["state"] == "running":  # died without recording why
+                        j.update(state="failed", message=f"export process exited ({p.returncode})")
+                        save_job(j)
+                    cur.update(proc=None, id=None)
+                if not cur["proc"]:
+                    queued = [j for j in list_jobs() if j["state"] == "queued"]
+                    if queued:
+                        j = queued[-1]                 # oldest first
+                        log(f"starting export {j['id']}")
+                        cur["id"] = j["id"]
+                        cur["proc"] = subprocess.Popen([sys.executable, tool, "export", "--job", j["id"]],
+                                                       start_new_session=True)
+            time.sleep(2)
+
+    def cancel(jid):
+        with lock:
+            if cur["id"] == jid and cur["proc"]:
+                os.killpg(cur["proc"].pid, signal.SIGTERM)   # takes ffmpeg down with it
+                return True
+            j = load_job(jid)
+            if j and j["state"] == "queued":
+                j.update(state="cancelled", message="cancelled", finished=int(time.time()))
+                save_job(j)
+                return True
+        return False
+
+    class H(BaseHTTPRequestHandler):
+        def send(self, code, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt, *a):
+            pass
+
+        def parts(self):
+            return [p for p in self.path.split("?")[0].split("/") if p]
+
+        def do_GET(self):
+            if self.parts() == ["exports"]:
+                return self.send(200, {"jobs": list_jobs(), "max_hours": max_sec / 3600,
+                                       "keep_days": float(CONF["EXPORT_KEEP_DAYS"])})
+            self.send(404, {"error": "not found"})
+
+        def do_POST(self):
+            # JSON only: a cross-site form can't send it without a CORS preflight, which we never answer
+            if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
+                return self.send(415, {"error": "expected application/json"})
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 10000:
+                return self.send(413, {"error": "too large"})
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except json.JSONDecodeError:
+                return self.send(400, {"error": "bad JSON"})
+            p = self.parts()
+            if len(p) == 3 and p[0] == "exports" and p[2] == "cancel" and JOB_ID_RE.fullmatch(p[1]):
+                return self.send(200 if cancel(p[1]) else 409, {"ok": True})
+            if p != ["exports"]:
+                return self.send(404, {"error": "not found"})
+            try:
+                cams = body["cameras"]
+                s, e = int(body["start"]), int(body["end"])
+                enc = body.get("encode", "copy")
+                crf = int(body.get("crf", 30))
+                height = body.get("height") and int(body["height"])
+                known = known_cameras()
+                if (not isinstance(cams, list) or not 0 < len(cams) <= 32
+                        or not all(isinstance(c, str) and CAM_RE.fullmatch(c) and c in known for c in cams)):
+                    raise ValueError("unknown camera")
+                if not 0 < e - s <= max_sec:
+                    raise ValueError(f"range must be between 1 second and {max_sec / 3600:g} hours")
+                if enc not in ("copy", "x265") or crf not in CRFS or (height and height not in HEIGHTS):
+                    raise ValueError("bad encoding options")
+            except (KeyError, TypeError, ValueError) as ex:
+                return self.send(400, {"error": str(ex)})
+            job = new_job(sorted(set(cams), key=cams.index), s, e, enc, crf, height)
+            self.send(201, job)
+
+        def do_DELETE(self):
+            p = self.parts()
+            if len(p) != 2 or p[0] != "exports" or not JOB_ID_RE.fullmatch(p[1]) or not load_job(p[1]):
+                return self.send(404, {"error": "not found"})
+            if cancel(p[1]):
+                for _ in range(20):                    # let it stop before removing its files
+                    if load_job(p[1])["state"] not in ("queued", "running"):
+                        break
+                    time.sleep(0.5)
+            shutil.rmtree(EXPORTS / p[1], ignore_errors=True)
+            self.send(200, {"ok": True})
+
+    host, _, port = CONF["EXPORT_LISTEN"].rpartition(":")
+    threading.Thread(target=worker, daemon=True).start()
+    srv = ThreadingHTTPServer((host or "127.0.0.1", int(port)), H)
+    def stop(_sig, _frm):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, stop)
+    log(f"export API on {CONF['EXPORT_LISTEN']}, jobs in {EXPORTS}")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    with lock:
+        if cur["proc"]:
+            os.killpg(cur["proc"].pid, signal.SIGTERM)
+    return 0
+
+
 # --- check -------------------------------------------------------------------
 
 def cmd_check(_args):
@@ -653,6 +1080,16 @@ def main():
     c.add_argument("start")
     c.add_argument("duration")
     c.add_argument("out", nargs="?")
+    x = sub.add_parser("export")
+    x.add_argument("--job", help="run a job queued by serve")
+    x.add_argument("--cams", help="comma separated")
+    x.add_argument("--start", help="'YYYY-MM-DD HH:MM[:SS]' local time")
+    x.add_argument("--end")
+    x.add_argument("--duration", help="instead of --end: 45m, 1h30m, ...")
+    x.add_argument("--x265", action="store_true", help="re-encode to H.265 (slow; smaller, one file per camera)")
+    x.add_argument("--crf", type=int, default=30, choices=CRFS, metavar="18-40")
+    x.add_argument("--height", type=int, choices=HEIGHTS, help="scale down to this height (with --x265)")
+    sub.add_parser("serve")
     a = p.parse_args()
     if a.cmd not in ("filter", "check") and not MARKER.exists():
         sys.exit(f"{ARCHIVE} not mounted (marker {MARKER} missing)")
@@ -661,7 +1098,8 @@ def main():
     TMP = Path(tempfile.mkdtemp(prefix=f"{a.cmd}-", dir=CONF["TMP_DIR"]))
     try:
         rc = {"consolidate": cmd_consolidate, "index": cmd_index, "filter": cmd_filter, "harvest": cmd_harvest,
-              "timelapse": cmd_timelapse, "clip": cmd_clip, "check": cmd_check}[a.cmd](a)
+              "timelapse": cmd_timelapse, "clip": cmd_clip, "check": cmd_check,
+              "export": cmd_export, "serve": cmd_serve}[a.cmd](a)
     finally:
         shutil.rmtree(TMP, ignore_errors=True)
     sys.exit(rc or 0)

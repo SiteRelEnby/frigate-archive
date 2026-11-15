@@ -1,0 +1,19 @@
+[Unit]
+Description=Export API for the frigate-archive review page (frigate-archive-tool serve)
+Documentation=file://@DOCDIR@/README.md
+After=network-online.target remote-fs.target
+Wants=network-online.target
+
+[Service]
+ExecStart=@BINDIR@/frigate-archive-tool serve
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=30
+# x265 exports can use every core: keep them behind Frigate
+Nice=15
+CPUWeight=20
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target

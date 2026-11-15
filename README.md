@@ -16,9 +16,12 @@ and moves everything to an archive filesystem (NFS, SMB, a second disk). There i
 - optional **nightly timelapses**, e.g. a workday in about 6 minutes, where clicking jumps to
   the real footage;
 - **clips** from the command line: `frigate-clip garden "2026-10-22 14:00" 45m`.
+- **exports** from the page: pick a range and cameras, get one file per camera, optionally
+  re-encoded to H.265 to save space.
 
-Everything runs on the Frigate host as two small scripts and a pair of systemd timers. There's
-no database and no extra service, and nothing about Frigate itself changes.
+Everything runs on the Frigate host as two small scripts and a pair of systemd timers, plus an
+optional localhost-only export service for the page. There's no database, and nothing about
+Frigate itself changes.
 
 ---
 
@@ -30,6 +33,7 @@ no database and no extra service, and nothing about Frigate itself changes.
 - [Configuration](#configuration)
 - [Frigate settings](#frigate-settings)
 - [Review page](#review-page)
+- [Exports](#exports)
 - [Command line](#command-line)
 - [Archive layout](#archive-layout)
 - [Status and alerting](#status-and-alerting)
@@ -102,6 +106,7 @@ sudo $EDITOR /etc/frigate-archive/frigate-archive.conf
 sudo touch /mnt/frigate-archive/.frigate-archive     # on the mounted archive (your ARCHIVE path)
 sudo frigate-archive-tool check
 sudo systemctl enable --now frigate-archive.timer frigate-timelapse.timer
+sudo systemctl enable --now frigate-archive-export.service   # optional: Export on the review page
 ```
 
 `install.sh` puts:
@@ -168,6 +173,10 @@ variables with the same names override it, which is handy for testing. Point
 | `STATUS_FILE` | `/var/lib/frigate-archive/status.json` | Status written every run |
 | `MQTT_HOST`, `MQTT_PORT`, `MQTT_USER`, `MQTT_TOPIC` | *(off)*, `1883`, –, `frigate/archive/status` | Optional retained MQTT status |
 | `MQTT_PASSWORD` / `MQTT_PASSWORD_FILE` / `MQTT_PASSWORD_KEY` | – | Inline; a file holding the password; or `KEY=value` looked up in an env file (e.g. reuse Frigate's `.env`) |
+| `EXPORT_LISTEN` | `127.0.0.1:8597` | Where `serve` (the export API) listens. Keep it on localhost. |
+| `EXPORT_KEEP_DAYS` | `7` | Delete finished exports after this many days |
+| `EXPORT_MAX_HOURS` | `24` | Longest range one export may cover |
+| `EXPORT_THREADS` | *(auto)* | x265 thread pool size (`pools=`); set it to leave cores for Frigate |
 | `LOCK_FILE`, `TMP_DIR` | `/run/frigate-archive.lock`, `/var/tmp/frigate-archive` | Internals |
 
 `frigate-archive.conf.example` documents each setting in place.
@@ -234,6 +243,8 @@ Features:
   severity and camera.
 - **Timelapse mode:** a clock shows each frame's real time. Click the timeline to seek, and
   *Open footage at this moment* to jump into the real footage.
+- **Export** (needs the export API, below): pick a range, tick cameras, get **one video file
+  per camera** to download. See [Exports](#exports).
 
 | Key | Action |
 |---|---|
@@ -241,12 +252,70 @@ Features:
 | `←` `→` | ±10 s (`shift`: ±1 min) |
 | `[` `]` | Slower / faster |
 | `n` `p` | Next / previous event |
+| `i` `o` | Export range: start / end at the playhead |
+| `shift`-drag | Select an export range on the timeline |
 
 **Codecs:** footage plays in its original codec. **HEVC/H.265** plays in Chrome or Edge with
 hardware decoding, and in Safari. Firefox can't play it; use the download link. Timelapses
 are H.264 and play anywhere.
 
-The most recent hour or so isn't joined yet, so it's only in Frigate's own UI.
+The most recent hour or so isn't joined yet, so it doesn't show on the timeline. Exports
+still include it (from the raw segments), and Frigate's own UI has it.
+
+## Exports
+
+The page's **Export…** button opens a panel:
+
+1. **Range:** shift-drag across the timeline (any row, or the zoom strip), press `i`/`o` at the
+   playhead, or type from/to.
+2. **Cameras:** any combination; each gets its own file.
+3. **Format:**
+   - **Original:** stream copy. Fast (mostly NAS speed), exact quality, same size as the
+     recording. If a camera changed codec or resolution inside the range, that camera gets
+     extra `….p2.mp4` parts, since a stream copy can't splice them.
+   - **H.265 (smaller):** re-encoded with x265 (`preset medium`). Always one file per camera:
+     every run is scaled/padded to one size and audio is normalized (silence added where a
+     run had none). Quality *high / balanced / small* = CRF 28 / 30 / 32; optional downscale
+     to 1440p–480p.
+4. Jobs run **one at a time** in the background with progress, cancel and delete. Finished
+   files are in `ARCHIVE/exports/<id>/` and are deleted after `EXPORT_KEEP_DAYS`.
+
+Footage comes from the joined hours, plus raw segments (local first, then staged) for hours
+not joined yet, so a range can reach to within a couple of minutes of now. Gaps where a
+camera recorded nothing are skipped, not padded.
+
+**What to expect from H.265:** these are re-encodes of footage the camera already compressed,
+so savings depend on what you trade. One sample (2304×1296 H.264 at ~1.2 Mbit/s, 15 fps):
+
+| Setting | Size vs original | Encode speed (18 cores) |
+|---|---|---|
+| CRF 30 | −16% | ~4× realtime |
+| CRF 32 | −37% | ~4× realtime |
+| CRF 30, 1080p | −49% | ~5× realtime |
+| CRF 28, 720p | −75% | ~10× realtime |
+
+At ~4× realtime, an hour of one 1440p camera takes about 15 minutes. Cameras that already
+record in HEVC gain less. The service runs at `Nice=15` / `CPUWeight=20` so Frigate wins
+when they compete; `EXPORT_THREADS` caps it further. (Hardware encoding isn't used: VAAPI
+generally isn't available on the host when only the Frigate container has the GPU driver.
+SVT-AV1 was tried and produced *larger* files on this kind of footage.)
+
+### Export API
+
+`frigate-archive-tool serve` (run by `frigate-archive-export.service`) is a small JSON API on
+`EXPORT_LISTEN`. It has **no authentication of its own**: keep it on localhost and proxy it
+behind the same `auth_request` as the page (the `/archive/api/` block in
+`contrib/nginx-archive.conf`). Without it the page simply hides the Export button.
+
+| Request | Does |
+|---|---|
+| `GET /exports` | List jobs (newest first), plus `max_hours` and `keep_days` |
+| `POST /exports` | `{"cameras":[…], "start":epoch, "end":epoch, "encode":"copy"\|"x265", "crf":18–40, "height":null\|480…1440}` → queued job |
+| `POST /exports/<id>/cancel` | Cancel a queued or running job |
+| `DELETE /exports/<id>` | Cancel if needed, then delete the job and its files |
+
+POSTs must be `Content-Type: application/json`, so a cross-site form can't trigger one. Jobs
+interrupted by a restart are queued again.
 
 ## Command line
 
@@ -258,6 +327,11 @@ frigate-archive-tool consolidate        join finished hours (time-boxed)
 frigate-archive-tool index              rebuild index.json, prune past KEEP_DAYS
 frigate-archive-tool harvest            save Frigate metadata for not-yet-joined hours
 frigate-archive-tool timelapse [YYYY-MM-DD] [--cams a,b]   default: yesterday, TIMELAPSE_CAMERAS
+
+frigate-archive-tool export --cams a,b --start T (--end T | --duration D) [--x265 [--crf N] [--height H]]
+    one file per camera into ARCHIVE/exports/<id>/ (shows up in the page's job list too);
+    T is local "YYYY-MM-DD HH:MM[:SS]", "HH:MM" for today, or @epoch (unambiguous across DST)
+frigate-archive-tool serve              the export API (normally frigate-archive-export.service)
 
 frigate-clip <camera> <start> <duration> [out.mp4]
     frigate-clip garden "2026-10-22 14:00" 45m      -> ARCHIVE/clips/garden_20261022_140000_45m.mp4
@@ -286,6 +360,7 @@ Dates and hours under `recordings/` and `hourly/` are **UTC**, matching Frigate'
 | `thumbs/<cam>/<review-id>.webp` | Review thumbnails |
 | `timelapse/<cam>/<local date>.mp4` / `.json` | Timelapse and its frame → wall-clock map |
 | `clips/` | `frigate-clip` output |
+| `exports/<id>/job.json`, `*.mp4` | Exports (page or `frigate-archive-tool export`), kept `EXPORT_KEEP_DAYS` |
 | `.meta/<cam>/<date>/<HH>.json` | Harvested Frigate metadata awaiting a join |
 | `index.json` | Cameras, available hours, timelapse days |
 

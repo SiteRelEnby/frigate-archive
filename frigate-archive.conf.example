@@ -53,6 +53,22 @@ TIMELAPSE_FPS=30
 # Empty = system timezone. install.sh also uses it to schedule the nightly timer.
 TZ=""
 
+# --- Exports (review page "Export…", via frigate-archive-export.service) ------
+
+# Where the export API listens. It has no auth of its own: keep it on localhost and proxy it
+# behind the page's auth_request (see contrib/nginx-archive.conf).
+EXPORT_LISTEN=127.0.0.1:8597
+
+# Finished exports are deleted after this many days.
+EXPORT_KEEP_DAYS=7
+
+# Longest range a single export may cover.
+EXPORT_MAX_HOURS=24
+
+# x265 thread pool size for H.265 exports. Empty = all cores (the service already runs at
+# low priority); set e.g. 8 to leave headroom for Frigate.
+EXPORT_THREADS=""
+
 # --- Status / alerting -------------------------------------------------------
 
 # Status JSON written every run. Alert when last_success is older than about an hour.

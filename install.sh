@@ -35,11 +35,12 @@ BIN_DIR=$PREFIX/bin
 DOC_DIR=$PREFIX/share/doc/frigate-archive
 WWW_DIR=${WWW_DIR:-$PREFIX/share/frigate-archive/www}
 HERE=$(cd "$(dirname "$0")" && pwd)
-UNITS=(frigate-archive.service frigate-archive.timer frigate-timelapse.service frigate-timelapse.timer)
+UNITS=(frigate-archive.service frigate-archive.timer frigate-timelapse.service frigate-timelapse.timer
+       frigate-archive-export.service)
 
 if [[ $UNINSTALL == 1 ]]; then
     if [[ $SYSTEMD == 1 ]]; then
-        systemctl disable --now frigate-archive.timer frigate-timelapse.timer 2>/dev/null || true
+        systemctl disable --now frigate-archive.timer frigate-timelapse.timer frigate-archive-export.service 2>/dev/null || true
         for u in "${UNITS[@]}"; do rm -f "$UNIT_DIR/$u"; done
         rm -rf "$UNIT_DIR/frigate-timelapse.timer.d/frigate-archive-tz.conf"
         rmdir "$UNIT_DIR/frigate-timelapse.timer.d" 2>/dev/null || true
@@ -96,8 +97,10 @@ if [[ $SYSTEMD == 1 ]]; then
     fi
     systemctl daemon-reload
     if [[ $ENABLE == 1 ]]; then
-        systemctl enable --now frigate-archive.timer frigate-timelapse.timer
+        systemctl enable --now frigate-archive.timer frigate-timelapse.timer frigate-archive-export.service
     fi
+    # pick up the new code if the export API is already running (a running export is re-queued)
+    systemctl try-restart frigate-archive-export.service
 fi
 
 cat <<EOF
@@ -108,4 +111,5 @@ next:
   3. frigate-archive-tool check
   4. systemctl enable --now frigate-archive.timer frigate-timelapse.timer   (or re-run with --enable)
   5. optional review page: see $DOC_DIR/nginx-archive.conf
+  6. optional exports from the page: systemctl enable --now frigate-archive-export.service
 EOF
