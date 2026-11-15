@@ -121,6 +121,7 @@
   .bar { flex: 1; height: 12px; background: var(--track); border: 1px solid var(--track-line); border-radius: 7px; overflow: hidden; }
   .bar i { display: block; height: 100%; background: var(--accent); border-radius: 6px 0 0 6px; transition: width .5s; }
   .prog b { font-variant-numeric: tabular-nums; min-width: 3.2em; text-align: right; }
+  footer { color: var(--dim); font-size: 12px; text-align: center; padding: 0 16px 20px; }
   .tip { position: fixed; pointer-events: none; background: var(--tip); border: 1px solid var(--line); border-radius: 6px;
     padding: 4px 8px; font-size: 12px; white-space: nowrap; z-index: 10; font-variant-numeric: tabular-nums; }
 </style>
@@ -242,6 +243,7 @@
     </section>
   </div>
 </div>
+  <footer><a href="https://github.com/SiteRelEnby/frigate-archive">frigate-archive</a> v<span id="ver">0.1.0</span></footer>
 <div class="tip" id="tip" hidden></div>
 
 <script>

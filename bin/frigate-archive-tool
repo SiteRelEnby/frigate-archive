@@ -49,6 +49,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+VERSION = "0.1.0"                # keep in step with the footer in www/index.html
+
 # --- configuration -----------------------------------------------------------
 
 DEFAULTS = {
@@ -1117,6 +1119,7 @@ def main():
     if Path(sys.argv[0]).name == "frigate-clip":
         sys.argv.insert(1, "clip")
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=f"frigate-archive {VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True)
     for name in ("consolidate", "index", "filter", "harvest", "check"):
         sub.add_parser(name)

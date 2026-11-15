@@ -38,6 +38,7 @@ Frigate itself changes.
 - [Status and alerting](#status-and-alerting)
 - [Operations](#operations)
 - [Limitations](#limitations)
+- [Versions](#versions)
 - [License](#license)
 
 ---
@@ -50,7 +51,7 @@ Frigate itself changes.
         │
         │  every 5 min: frigate-archive (systemd timer)
         │
-        ├─ 1. rsync recent segments of hours not yet joined ──▶ recordings/…        raw staging
+        ├─ 1. rsync recent segments of hours not yet joined ──▶ recordings/...        raw staging
         │                                                         (small exposure window)
         ├─ 2. frigate-archive-tool consolidate ───────────────▶ hourly/<cam>/<date>/<HH>.mp4
         │       finished hours, newest first, time-boxed;          hourly/<cam>/<date>/<HH>.json
@@ -68,17 +69,17 @@ Some design points:
 
 - **Each byte goes over the network about once.** Finished hours are joined from the local
   copy and written to the archive directly. Raw segments are only staged for the most recent
-  hours, so a dead Frigate host loses minutes, not hours.
+  hours, so a dead Frigate host only loses a few minutes.
 - **Joining never re-encodes**, so it's cheap even for 4K HEVC. When a camera changes codec
   or resolution mid-hour, the hour is split into parts (`HH.mp4`, `HH.p2.mp4`).
 - **Gaps are mapped, not filled.** Camera dropouts are simply absent from the joined file.
   The sidecar records each segment's wall-clock start and its offset in the file, which the
   page, clips and timelapses use to stay accurate across gaps.
-- **It's robust to bad segments.** Segments with corrupt timestamps (common around camera
+- **Robust to bad segments.** Segments with corrupt timestamps (common around camera
   reboots) are trimmed to their real length. If ffmpeg chokes on an hour, the segments are
   tested one by one and the bad ones dropped. A join that still fails is marked and skipped,
   not retried forever.
-- **It's safe against an unmounted archive.** Nothing runs unless the archive contains a
+- **Safe against an unmounted archive.** Nothing runs unless the archive contains a
   marker file, so an unmounted mountpoint is never filled.
 
 ## Requirements
@@ -99,7 +100,7 @@ Some design points:
 ## Install
 
 ```bash
-git clone <this repo> && cd frigate-archive
+git clone https://github.com/SiteRelEnby/frigate-archive.git && cd frigate-archive
 sudo ./install.sh                      # installs to /usr/local, creates /etc/frigate-archive/frigate-archive.conf
 sudo $EDITOR /etc/frigate-archive/frigate-archive.conf
 sudo touch /mnt/frigate-archive/.frigate-archive     # on the mounted archive (your ARCHIVE path)
@@ -147,13 +148,13 @@ nas:/export/frigate-archive  /mnt/frigate-archive  nfs  _netdev,nofail,hard,x-sy
   outage just stalls the sync until the server is back. Runs can't overlap, and the stall
   shows up as a stale `last_success`.
 - **Permissions:** the archive must be writable by root. With root squash or mapall, give the
-  export's directory to the mapped user. The scripts never chown, so that works.
+  export's directory to the mapped user. The scripts will not attempt to run `chown`.
 
 ## Configuration
 
 `/etc/frigate-archive/frigate-archive.conf` uses shell-style `KEY=value` lines. Environment
-variables with the same names override it, which is handy for testing. Point
-`FRIGATE_ARCHIVE_CONF` at a different file to use another config.
+variables with the same names override the base config. Point `FRIGATE_ARCHIVE_CONF` at a
+different file to use another config.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -216,18 +217,10 @@ Things to know:
 ## Review page
 
 The page is one static HTML file with no build step. It reads `index.json`, the hourly
-sidecars and the mp4s straight from the archive. Serve both through the nginx that fronts
-Frigate. `contrib/nginx-archive.conf` gates them on **Frigate's own login**: nginx asks
-Frigate's `/api/profile` whether the `frigate_token` cookie is valid, and sends you to
-`/login` if not.
+sidecars and the mp4s straight from the archive, and (optionally) talks to the export API.
+The nicest way to run it is under Frigate's own URL, e.g. `https://frigate.example/archive/`.
 
-```nginx
-# inside the server { } that proxies Frigate — full example in contrib/nginx-archive.conf
-location /archive/      { auth_request /_archive_auth; alias /usr/local/share/frigate-archive/www/; }
-location /archive/data/ { auth_request /_archive_auth; alias /mnt/frigate-archive/; }
-```
-
-Features:
+### Features
 
 - **Timeline**, one row per camera for the day:
   - grey where footage exists;
@@ -243,8 +236,8 @@ Features:
   severity and camera.
 - **Timelapse mode:** a clock shows each frame's real time. Click the timeline to seek, and
   *Open footage at this moment* to jump into the real footage.
-- **Export** (needs the export API, below): pick a range, tick cameras, get **one video file
-  per camera** to download. See [Exports](#exports).
+- **Export** (needs the export API, below): pick a range, select cameras, get one video file
+  per camera to download. See [Exports](#exports).
 
 | Key | Action |
 |---|---|
@@ -262,9 +255,110 @@ are H.264 and play anywhere.
 The most recent hour or so isn't joined yet, so it doesn't show on the timeline. Exports
 still include it (from the raw segments), and Frigate's own UI has it.
 
+### Serving it at `<your Frigate URL>/archive/`
+
+Most Frigate installs already have a reverse proxy in front for TLS (nginx, Caddy, Traefik, etc.).
+Add a few path routes to it, all checked against **Frigate's own login**, and the archive
+sits next to Frigate's UI with no second hostname and no second login:
+
+| Path | Goes to |
+|---|---|
+| `/archive/` | the page (`$PREFIX/share/frigate-archive/www/`, static) |
+| `/archive/data/` | the archive directory (`ARCHIVE`, static, read-only) |
+| `/archive/api/` | the export API (`EXPORT_LISTEN`), optional |
+| everything else | Frigate, as before |
+
+Each `/archive/` route first makes a subrequest to Frigate's **`/api/profile`** with the
+browser's cookies: 2xx means logged in, so serve it; 401 means redirect to Frigate's
+`/login`.
+
+- **Same origin:** the browser sends Frigate's `frigate_token` cookie to `/archive/` too, so
+  logging in to Frigate logs you in here.
+- **Relative URLs:** the page only uses `data/`, `api/` and `../` (the *Frigate ↗* button). Any
+  prefix works as long as all three routes share it; the page needs no configuration.
+- **The web server serves the video files itself,** with range requests, so seeking in
+  hour-long files is instant and nothing extra sits in the data path.
+
+Some considerations:
+
+- **Check auth against the authenticated port (8971),** not the unauthenticated internal
+  port 5000. Through 5000 `/api/profile` always succeeds, so everyone gets in.
+- **Frigate's 8971 uses a self-signed certificate** by default. Skip verification on that
+  hop; it's localhost.
+- **After `/login`, Frigate lands on its own home page,** not back on the archive. Open
+  `/archive/` again (or bookmark it).
+- **Use your front proxy, not the nginx inside Frigate's container:** that one is
+  regenerated on every container upgrade.
+- **Proxy timeouts and buffering don't matter here:** the routes are static files and small
+  JSON requests.
+
+**nginx** (tested; the full block with comments is `contrib/nginx-archive.conf`). This goes
+inside the `server { }` that already proxies Frigate:
+
+```nginx
+location = /archive { return 301 /archive/; }
+location /archive/      { auth_request /_archive_auth; error_page 401 = @archive_login;
+                          alias /usr/local/share/frigate-archive/www/; index index.html; }
+location /archive/data/ { auth_request /_archive_auth; error_page 401 = @archive_login;
+                          alias /mnt/frigate-archive/; }
+location /archive/api/  { auth_request /_archive_auth; error_page 401 = @archive_login;
+                          proxy_pass http://127.0.0.1:8597/; }
+location = /_archive_auth {
+    internal;
+    proxy_pass https://127.0.0.1:8971/api/profile;
+    proxy_ssl_verify off;
+    proxy_pass_request_body off;
+    proxy_set_header Content-Length "";
+}
+location @archive_login { return 302 /login; }
+```
+
+**Caddy** (an *untested* sketch of the same thing with `forward_auth`; unlike the nginx
+version, a logged-out visitor gets Frigate's 401 instead of a redirect to `/login`):
+
+```caddy
+frigate.example.com {
+    redir /archive /archive/
+    handle /archive/* {
+        forward_auth https://127.0.0.1:8971 {
+            uri /api/profile
+            transport http {
+                tls_insecure_skip_verify
+            }
+        }
+        handle_path /archive/api/* {
+            reverse_proxy 127.0.0.1:8597
+        }
+        handle_path /archive/data/* {
+            root * /mnt/frigate-archive
+            file_server
+        }
+        handle_path /archive/* {
+            root * /usr/local/share/frigate-archive/www
+            file_server
+        }
+    }
+    handle {
+        reverse_proxy https://127.0.0.1:8971 {
+            transport http {
+                tls_insecure_skip_verify
+            }
+        }
+    }
+}
+```
+
+**Other proxies** (Traefik ForwardAuth, HAProxy, Apache `mod_auth_request`, ...) need the same
+four pieces: the static page, the static archive directory, the optional API proxy, and an
+auth subrequest to `/api/profile` on 8971.
+
+A **separate hostname** also works (e.g. `archive.example`), but then Frigate's cookie isn't
+sent, so you'd need your own auth there. The same-URL setup avoids that.
+
+
 ## Exports
 
-The page's **Export…** button opens a panel:
+The page's **Export...** button opens a panel:
 
 1. **Range:** shift-drag across the timeline (any row, or the zoom strip), press `i`/`o` at the
    playhead, or type from/to.
@@ -272,7 +366,7 @@ The page's **Export…** button opens a panel:
 3. **Format:**
    - **Original:** stream copy. Fast (mostly NAS speed), exact quality, same size as the
      recording. If a camera changed codec or resolution inside the range, that camera gets
-     extra `….p2.mp4` parts, since a stream copy can't splice them.
+     extra `....p2.mp4` parts, since a stream copy can't splice them.
    - **H.265 GPU / H.265 CPU:** re-encoded, always one file per camera: every run is
      scaled/padded to one size and audio is normalized (silence added where a run had none).
      Quality *high / balanced / small* = 28 / 30 / 32 (x265 CRF, or VAAPI ICQ for the GPU,
@@ -304,12 +398,11 @@ so savings depend on what you trade. One sample (2304×1296 H.264 at ~1.2 Mbit/s
 
 How much a given setting saves varies a lot with the scene (night noise, foliage, a busy
 street), so treat these as a rough guide. Cameras that already record in HEVC gain less.
-With x265, an hour of one 1440p camera takes about 15 minutes; on the GPU, about 5.
 
-The service runs at `Nice=15` / `CPUWeight=20` so Frigate wins when they compete;
-`EXPORT_THREADS` caps x265 further. The GPU option shares the iGPU with Frigate's decoding
-and detection; watch Frigate's GPU stats during long GPU exports. (SVT-AV1 was tried and produced *larger*
-files on this kind of footage, so it isn't offered.)
+The service runs at `Nice=15` / `CPUWeight=20`; `EXPORT_THREADS` caps x265 further.
+The GPU option will share the GPU with Frigate's decoding and detection; watch Frigate's
+GPU stats during long GPU exports. (SVT-AV1 was tried and produced *larger* files on this
+kind of footage, so it isn't offered.)
 
 ### Export API
 
@@ -321,7 +414,7 @@ behind the same `auth_request` as the page (the `/archive/api/` block in
 | Request | Does |
 |---|---|
 | `GET /exports` | List jobs (newest first), plus `max_hours`, `keep_days` and the available `encoders` |
-| `POST /exports` | `{"cameras":[…], "start":epoch, "end":epoch, "encode":"copy"\|"x265"\|"vaapi", "crf":18–40, "height":null\|480…1440}` → queued job |
+| `POST /exports` | `{"cameras":[...], "start":epoch, "end":epoch, "encode":"copy"\|"x265"\|"vaapi", "crf":18–40, "height":null\|480...1440}` → queued job |
 | `POST /exports/<id>/cancel` | Cancel a queued or running job |
 | `DELETE /exports/<id>` | Cancel if needed, then delete the job and its files |
 
@@ -352,7 +445,7 @@ frigate-clip <camera> <start> <duration> [out.mp4]
 - **Clip times** are local (`TZ`). Durations look like `90s`, `45m` or `1h30m`.
 - **Clips are cut without re-encoding**, so they snap to keyframes, which are usually
   1–2 s apart.
-- **Codec changes:** a range that spans one produces `…p2.mp4` as well.
+- **Codec changes:** a range that spans one produces `...p2.mp4` as well.
 
 All tool commands are safe to run by hand while the timers are active. Each process uses its
 own scratch directory.
@@ -365,7 +458,7 @@ Dates and hours under `recordings/` and `hourly/` are **UTC**, matching Frigate'
 |---|---|
 | `.frigate-archive` | Marker. Nothing runs without it. |
 | `recordings/<date>/<HH>/<cam>/MM.SS.mp4` | Raw staging for recent hours |
-| `hourly/<cam>/<date>/<HH>.mp4` (`.p2.mp4`, …) | Joined footage: faststart; HEVC tagged `hvc1` for browsers |
+| `hourly/<cam>/<date>/<HH>.mp4` (`.p2.mp4`, ...) | Joined footage: faststart; HEVC tagged `hvc1` for browsers |
 | `hourly/<cam>/<date>/<HH>.json` | Sidecar (below) |
 | `hourly/<cam>/<date>/<HH>.failed` | A join that failed, with the error. Delete it to retry. |
 | `thumbs/<cam>/<review-id>.webp` | Review thumbnails |
@@ -458,7 +551,16 @@ to `TIMELAPSE_CAMERAS` if you want timelapses.
   falling back to a full decode.
 - **Browser codec support** limits HEVC playback on the page; see above.
 - **Single-user page.** It's a static page with no per-user state. Anyone who can log in to
-  Frigate can see every camera's archive.
+  Frigate can see every camera's archive and start exports, whatever their Frigate role or
+  camera permissions.
+
+## Versions
+
+The page footer and `frigate-archive-tool --version` show the version. To release, bump
+`VERSION` in `bin/frigate-archive-tool` and the footer in `www/index.html` together, commit,
+and tag `vX.Y.Z`.
+
+## Roadmap
 
 ## License
 
