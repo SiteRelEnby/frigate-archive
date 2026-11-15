@@ -67,6 +67,7 @@ install -D -m 644 "$HERE/www/index.html" "$WWW_DIR/index.html"
 install -D -m 644 "$HERE/README.md" "$DOC_DIR/README.md"
 install -D -m 644 "$HERE/frigate-archive.conf.example" "$DOC_DIR/frigate-archive.conf.example"
 install -D -m 644 "$HERE/contrib/nginx-archive.conf" "$DOC_DIR/nginx-archive.conf"
+install -D -m 644 "$HERE/contrib/crontab" "$DOC_DIR/crontab.example"
 
 # config: never overwrite an existing one
 CONF=$CONF_DIR/frigate-archive.conf

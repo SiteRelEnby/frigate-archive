@@ -18,7 +18,7 @@
     --text: #e6e9ee; --dim: #8b95a3; --accent: #5aa2ff; --on-accent: #06111f;
     --motion: #3d7fd9; --footage: #232a33; --gap: #12161b;
     --alert: #ff5d5d; --detect: #f2b441; --head: #ffffff;
-    --track: #2b333e; --track-line: #3d4756; --tip: #000;
+    --track: #2b333e; --track-line: #3d4756; --tip: #000; --pending: #66707f;
   }
   @media (prefers-color-scheme: light) {
     :root:not([data-theme="dark"]) {
@@ -27,7 +27,7 @@
       --text: #1a1f27; --dim: #5d6876; --accent: #1f6fd6; --on-accent: #ffffff;
       --motion: #3b7fe0; --footage: #d9dfe7; --gap: #f1f3f6;
       --alert: #d93636; --detect: #d48a00; --head: #111111;
-      --track: #e3e8ee; --track-line: #b9c3cf; --tip: #ffffff;
+      --track: #e3e8ee; --track-line: #b9c3cf; --tip: #ffffff; --pending: #9aa5b3;
     }
   }
   :root[data-theme="light"] {
@@ -36,7 +36,7 @@
     --text: #1a1f27; --dim: #5d6876; --accent: #1f6fd6; --on-accent: #ffffff;
     --motion: #3b7fe0; --footage: #d9dfe7; --gap: #f1f3f6;
     --alert: #d93636; --detect: #d48a00; --head: #111111;
-    --track: #e3e8ee; --track-line: #b9c3cf; --tip: #ffffff;
+    --track: #e3e8ee; --track-line: #b9c3cf; --tip: #ffffff; --pending: #9aa5b3;
   }
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }   /* class display rules (.overlay grid, .btn) would otherwise beat it */
@@ -121,6 +121,18 @@
   .bar { flex: 1; height: 12px; background: var(--track); border: 1px solid var(--track-line); border-radius: 7px; overflow: hidden; }
   .bar i { display: block; height: 100%; background: var(--accent); border-radius: 6px 0 0 6px; transition: width .5s; }
   .prog b { font-variant-numeric: tabular-nums; min-width: 3.2em; text-align: right; }
+  /* camera picker */
+  .campick { position: relative; }
+  .campop { position: absolute; top: calc(100% + 6px); left: 0; z-index: 20; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px; width: min(560px, calc(100vw - 32px)); box-shadow: 0 10px 30px rgba(0,0,0,.35); }
+  .presets { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 8px; }
+  .presets .k { color: var(--dim); font-size: 12px; margin-right: 2px; }
+  .camfilter { width: 100%; margin-bottom: 8px; background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  .camlist { columns: 170px; column-gap: 14px; max-height: 50vh; overflow-y: auto; }
+  .camlist label { display: flex; gap: 6px; align-items: center; padding: 2px 0; break-inside: avoid; cursor: pointer;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .btn.sm { padding: 2px 8px; font-size: 12px; }
+  .legend i.pend { background: repeating-linear-gradient(135deg, var(--pending) 0 2px, var(--gap) 2px 4px); }
   footer { color: var(--dim); font-size: 12px; text-align: center; padding: 0 16px 20px; }
   .tip { position: fixed; pointer-events: none; background: var(--tip); border: 1px solid var(--line); border-radius: 6px;
     padding: 4px 8px; font-size: 12px; white-space: nowrap; z-index: 10; font-variant-numeric: tabular-nums; }
@@ -138,6 +150,14 @@
     <div class="seg" id="modeSeg">
       <button class="btn on" data-mode="footage">Footage</button>
       <button class="btn" data-mode="timelapse" id="tlBtn">Timelapse</button>
+    </div>
+    <div class="campick">
+      <button class="btn" id="camBtn" title="Choose which cameras to show">Cameras</button>
+      <div class="campop" id="camPop" hidden>
+        <div class="presets" id="camPresets"></div>
+        <input type="search" class="camfilter" id="camFilter" placeholder="filter cameras…" hidden>
+        <div class="camlist" id="camList"></div>
+      </div>
     </div>
     <div class="spacer"></div>
     <button class="btn" id="exportBtn" hidden title="Export a time range as video files (shift-drag on the timeline to select)">Export…</button>
@@ -158,6 +178,7 @@
     </div>
     <div class="legend">
       <span><i style="background:var(--footage)"></i>footage</span>
+      <span title="Raw segments are on the archive; they become playable once their hour is joined (about 15 min after it ends). Exports already include them."><i class="pend"></i>on archive, not joined yet</span>
       <span><i style="background:var(--motion)"></i>motion above usual</span>
       <span><i style="background:var(--alert)"></i>alert</span>
       <span><i style="background:var(--detect)"></i>detection</span>
@@ -178,7 +199,8 @@
       <div class="spacer"></div>
       <button class="btn" id="xClose" title="Close">✕</button>
     </div>
-    <div class="xrow"><span class="k">cameras</span><span id="xCams" class="xrow" style="margin:0"></span></div>
+    <div class="xrow"><span class="k">cameras</span><span class="presets" id="xQuick" style="margin:0"></span></div>
+    <div class="xrow"><span class="k"></span><span id="xCams" class="xrow" style="margin:0"></span></div>
     <div class="xrow">
       <span class="k">format</span>
       <div class="seg" id="xEnc">
@@ -263,7 +285,11 @@ const st = {
   sev: new Set(["alert", "detection"]),
   sel: null,                   // export range {a, b} (epochs), drawn on the timeline
   api: false,                  // export API reachable
+  hidden: new Set(),           // cameras hidden by the camera picker (remembered per browser)
+  groups: {},                  // Frigate camera groups, from index.json
 };
+const visibleCams = () => st.cams.filter((c) => !st.hidden.has(c));
+const pendingAt = (cam, t) => (st.index?.cameras[cam]?.pending || []).some(([a, b]) => t >= a && t < b);
 
 // ---------- time helpers ----------
 const pad = (n) => String(n).padStart(2, "0");
@@ -278,6 +304,9 @@ const hourOf = (ep) => ep - (ep % 3600);
 // ---------- data ----------
 async function getJSON(url) { const r = await fetch(url, { cache: "no-cache" }); if (!r.ok) throw new Error(`${r.status} ${url}`); return r.json(); }
 
+// Sidecars come in one day.json per camera per UTC day (built by `index`); a single hour's
+// file is the fallback when day.json is missing or older than the hour.
+const dayFiles = new Map();          // "cam|utc-date" -> Promise<{HH: sidecar} | null>
 async function ensureHour(cam, ep) {
   const k = `${cam}|${ep}`;
   if (st.hours.has(k)) return st.hours.get(k);
@@ -285,7 +314,10 @@ async function ensureHour(cam, ep) {
   let h = null;
   if (avail.includes(ep)) {
     const [d, hh] = utcPath(ep);
-    try { h = await getJSON(`${DATA}hourly/${cam}/${d}/${hh}.json`); } catch (e) { console.warn(e); }
+    const dk = `${cam}|${d}`;
+    if (!dayFiles.has(dk)) dayFiles.set(dk, getJSON(`${DATA}hourly/${cam}/${d}/day.json`).then((j) => j.hours).catch(() => null));
+    h = (await dayFiles.get(dk))?.[hh] || null;
+    if (!h) { try { h = await getJSON(`${DATA}hourly/${cam}/${d}/${hh}.json`); } catch (e) { console.warn(e); } }
   }
   st.hours.set(k, h);
   return h;
@@ -316,7 +348,8 @@ async function loadDay(day) {
   [st.dayStart, st.dayEnd] = dayBounds(day);
   $("daySel").value = day;
   const jobs = [];
-  for (const cam of st.cams) for (let ep = hourOf(st.dayStart); ep < st.dayEnd; ep += 3600) jobs.push(ensureHour(cam, ep));
+  // only the cameras on screen: hidden ones load when they're shown
+  for (const cam of visibleCams()) for (let ep = hourOf(st.dayStart); ep < st.dayEnd; ep += 3600) jobs.push(ensureHour(cam, ep));
   await Promise.all(jobs);
   updateTlButton();
   renderAll();
@@ -346,6 +379,15 @@ function prep(cv) {
   return [g, w, h];
 }
 const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+function stripes(g) {
+  // diagonal hatch in the current theme's --pending colour (rebuilt each draw: the theme can change)
+  const c = document.createElement("canvas"); c.width = c.height = 6;
+  const p = c.getContext("2d");
+  p.fillStyle = css("--gap"); p.fillRect(0, 0, 6, 6);
+  p.strokeStyle = css("--pending"); p.lineWidth = 1.5;
+  p.beginPath(); p.moveTo(-1, 7); p.lineTo(7, -1); p.moveTo(-1, 1); p.lineTo(1, -1); p.moveTo(5, 7); p.lineTo(7, 5); p.stroke();
+  return g.createPattern(c, "repeat");
+}
 
 function drawAxis(cv, a, b, stepSec) {
   const [g, w, h] = prep(cv);
@@ -374,6 +416,12 @@ function drawRow(cv, cam, a, b, big) {
   }
   g.fillStyle = css("--footage");
   for (let x = 0; x <= w; x++) if (have[x]) g.fillRect(x, top, 1, h - top);
+  // staged on the archive but not joined into hourly files yet: hatched
+  const pend = (st.index.cameras[cam]?.pending || []).filter(([ps, pe]) => pe > a && ps < b);
+  if (pend.length) {
+    g.fillStyle = stripes(g);
+    for (const [ps, pe] of pend) { const x0 = Math.max(0, X(ps)); g.fillRect(x0, top, Math.max(1, Math.min(w, X(pe)) - x0), h - top); }
+  }
   g.fillStyle = css("--motion");
   for (let x = 0; x <= w; x++) if (motion[x] > base) {
     const f = Math.min(1, (motion[x] - base) / (top99 - base)), bh = Math.max(1, f * (h - top));
@@ -407,7 +455,7 @@ function zoomWindow() {
 
 function renderAll() {
   drawAxis($("axis"), st.dayStart, st.dayEnd, 3600);
-  for (const cam of st.cams) drawRow($(`row-${cam}`), cam, st.dayStart, st.dayEnd, false);
+  for (const cam of visibleCams()) drawRow($(`row-${cam}`), cam, st.dayStart, st.dayEnd, false);
   const [za, zb] = zoomWindow();
   const zc = st.cur?.cam || st.cam;
   $("zoomCam").textContent = zc || "";
@@ -418,15 +466,17 @@ function renderAll() {
 
 function buildRows() {
   const rows = $("rows"); rows.innerHTML = "";
-  for (const cam of st.cams) {
+  const cams = visibleCams();
+  const rh = cams.length > 12 ? 16 : cams.length > 8 ? 20 : 26;     // compact rows when there are many
+  for (const cam of cams) {
     const r = document.createElement("div"); r.className = "tl-row";
-    r.innerHTML = `<div class="tl-label" data-cam="${cam}" title="${cam}">${cam}</div><canvas id="row-${cam}" height="26"></canvas>`;
+    r.innerHTML = `<div class="tl-label" data-cam="${esc(cam)}" title="${esc(cam)}">${esc(cam)}</div><canvas id="row-${esc(cam)}" height="${rh}"></canvas>`;
     rows.appendChild(r);
     const cv = r.querySelector("canvas");
     hookCanvas(cv, () => [st.dayStart, st.dayEnd], cam);
     r.querySelector(".tl-label").onclick = () => { st.cam = cam; updateTlButton(); renderAll(); };
   }
-  hookCanvas($("zrow"), zoomWindow, null);
+  if (!cams.length) rows.innerHTML = `<div class="empty">No cameras shown — pick some under Cameras.</div>`;
 }
 
 function hookCanvas(cv, win, camFixed) {
@@ -435,7 +485,8 @@ function hookCanvas(cv, win, camFixed) {
     const t = tAt(e), cam = camFixed || st.cur?.cam || st.cam;
     const ev = reviewFor(cam, t - 60, t + 60).find((r) => st.sev.has(r.severity) && t >= r.start - 30 && t <= (r.end || r.start) + 30);
     const tip = $("tip"); tip.hidden = false;
-    tip.textContent = `${camFixed ? "" : cam + " · "}${hms(t)}${ev ? ` · ${ev.severity}: ${ev.objects.join(", ")}` : ""}`;
+    tip.textContent = `${camFixed ? "" : cam + " · "}${hms(t)}${ev ? ` · ${ev.severity}: ${ev.objects.join(", ")}` : ""}` +
+      (pendingAt(cam, t) ? " · on archive, not joined yet" : "");
     tip.style.left = Math.min(e.clientX + 12, innerWidth - tip.offsetWidth - 8) + "px"; tip.style.top = e.clientY + 16 + "px";
   });
   cv.addEventListener("mouseleave", () => { $("tip").hidden = true; });
@@ -478,7 +529,13 @@ async function playAt(cam, t, autoplay = true) {
   setMode("footage", false);
   st.cam = cam;
   const s = await findSeg(cam, t);
-  if (!s) { showOverlay(`No archived footage for ${cam} after ${hms(t)}.`); return; }
+  if (!s) {
+    showOverlay(pendingAt(cam, t)
+      ? `${cam} at ${hms(t)} is on the archive but not joined into an hourly file yet, so it can't play here. ` +
+        `Hours are joined about 15 minutes after they end; exports already include it.`
+      : `No archived footage for ${cam} after ${hms(t)}.`);
+    return;
+  }
   const off = s.off + Math.max(0, t - s.start);
   const url = partURL(cam, s.ep, s.pi);
   st.cur = { cam, ep: s.ep, pi: s.pi };
@@ -565,7 +622,7 @@ function setMode(mode, act = true) {
 function dayEvents() {
   const camFilter = $("evCam").value;
   const all = [];
-  for (const cam of st.cams) if (!camFilter || camFilter === cam) all.push(...reviewFor(cam, st.dayStart, st.dayEnd));
+  for (const cam of visibleCams()) if (!camFilter || camFilter === cam) all.push(...reviewFor(cam, st.dayStart, st.dayEnd));
   return all.filter((r) => st.sev.has(r.severity) && r.start >= st.dayStart && r.start < st.dayEnd).sort((a, b) => a.start - b.start);
 }
 
@@ -734,6 +791,15 @@ async function initExport() {
   document.querySelector(".xhint").hidden = false;
   $("xCams").innerHTML = st.cams.map((c) => `<label><input type="checkbox" value="${esc(c)}">${esc(c)}</label>`).join("");
   $("xCams").addEventListener("change", updateExportInfo);
+  // quick picks: all / none / what's on the timeline / Frigate's camera groups
+  const quick = [["all", st.cams], ["none", []], ["shown", null], ...Object.entries(st.groups)];
+  $("xQuick").innerHTML = quick.map(([n], i) => `<button class="btn sm" data-q="${i}">${esc(n)}</button>`).join("");
+  $("xQuick").onclick = (e) => {
+    const b = e.target.closest("[data-q]"); if (!b) return;
+    const [, list] = quick[+b.dataset.q], want = new Set(list || visibleCams());
+    document.querySelectorAll("#xCams input").forEach((i) => (i.checked = want.has(i.value)));
+    updateExportInfo();
+  };
   $("exportBtn").onclick = () => ($("exportPanel").hidden ? openExport() : closeExport());
   $("xClose").onclick = closeExport;
   $("xClear").onclick = () => { $("xFrom").value = ""; $("xTo").value = ""; setSel(null, null); };
@@ -798,7 +864,59 @@ function setTheme(t) {
   if (st.day) renderAll();                 // canvases read the palette when drawn
 }
 
+// ---------- camera picker ----------
+// Which cameras get a timeline row (and are loaded, and listed in events). Remembered per
+// browser as the *hidden* set, so cameras added later show up by default.
+function buildCamPicker() {
+  const presets = [["All", st.cams], ...Object.entries(st.groups), ["None", []]];
+  $("camPresets").innerHTML = `<span class="k">show</span>` +
+    presets.map(([n], i) => `<button class="btn sm" data-p="${i}">${esc(n)}</button>`).join("") +
+    (Object.keys(st.groups).length ? "" : `<span class="xnote">(camera groups from Frigate appear here)</span>`);
+  $("camPresets").onclick = (e) => {
+    const b = e.target.closest("[data-p]"); if (!b) return;
+    const show = new Set(presets[+b.dataset.p][1]);
+    st.hidden = new Set(st.cams.filter((c) => !show.has(c)));
+    applyCams();
+  };
+  $("camList").innerHTML = st.cams.map((c) =>
+    `<label title="${esc(c)}"><input type="checkbox" value="${esc(c)}">${esc(c)}</label>`).join("");
+  $("camList").onchange = (e) => {
+    if (!e.target.matches("input")) return;
+    e.target.checked ? st.hidden.delete(e.target.value) : st.hidden.add(e.target.value);
+    applyCams();
+  };
+  $("camFilter").hidden = st.cams.length <= 12;
+  $("camFilter").oninput = () => {
+    const q = $("camFilter").value.toLowerCase();
+    $("camList").querySelectorAll("label").forEach((l) => (l.hidden = !l.title.toLowerCase().includes(q)));
+  };
+  $("camBtn").onclick = (e) => { e.stopPropagation(); $("camPop").hidden = !$("camPop").hidden; if (!$("camPop").hidden && !$("camFilter").hidden) $("camFilter").focus(); };
+  document.addEventListener("click", (e) => { if (!e.target.closest(".campick")) $("camPop").hidden = true; });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("camPop").hidden = true; });
+  syncCamPicker();
+}
+function syncCamPicker() {
+  $("camList").querySelectorAll("input").forEach((i) => (i.checked = !st.hidden.has(i.value)));
+  const n = visibleCams().length;
+  $("camBtn").textContent = n === st.cams.length ? `Cameras (${n})` : `Cameras (${n}/${st.cams.length})`;
+  $("camBtn").classList.toggle("on", n !== st.cams.length);
+}
+function fillEvCam() {
+  const keep = $("evCam").value;
+  $("evCam").innerHTML = `<option value="">all shown cameras</option>` + visibleCams().map((c) => `<option>${esc(c)}</option>`).join("");
+  $("evCam").value = visibleCams().includes(keep) ? keep : "";
+}
+async function applyCams() {
+  try { localStorage.setItem("fa-hidden-cams", JSON.stringify([...st.hidden])); } catch (e) {}
+  syncCamPicker();
+  if (st.hidden.has(st.cam)) st.cam = visibleCams()[0] || st.cam;
+  buildRows();
+  fillEvCam();
+  if (st.day) await loadDay(st.day);       // fetches the newly shown cameras' data
+}
+
 function wire() {
+  hookCanvas($("zrow"), zoomWindow, null);
   document.querySelectorAll("#themeSeg .btn").forEach((b) => (b.onclick = () => setTheme(b.dataset.themeSet)));
   setTheme(document.documentElement.dataset.theme || "system");
   matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => { if (st.day) renderAll(); });
@@ -851,16 +969,24 @@ async function init() {
   try { st.index = await getJSON(`${DATA}index.json`); }
   catch (e) { showOverlay("Couldn't load the archive index — is the NFS share mounted?"); return; }
   st.cams = Object.keys(st.index.cameras).sort();
+  st.groups = Object.fromEntries(Object.entries(st.index.groups || {})
+    .map(([n, cs]) => [n, cs.filter((c) => st.cams.includes(c))]).filter(([, cs]) => cs.length));
+  try { (JSON.parse(localStorage.getItem("fa-hidden-cams")) || []).forEach((c) => st.cams.includes(c) && st.hidden.add(c)); } catch (e) {}
   $("keep").textContent = `· ${st.index.keep_days} days`;
-  for (const c of st.cams) $("evCam").insertAdjacentHTML("beforeend", `<option>${c}</option>`);
   const days = new Set();
-  for (const c of st.cams) for (const ep of st.index.cameras[c].hours) { days.add(localDate(ep)); days.add(localDate(ep + 3599)); }
+  for (const c of st.cams) {
+    for (const ep of st.index.cameras[c].hours) { days.add(localDate(ep)); days.add(localDate(ep + 3599)); }
+    for (const [a, b] of st.index.cameras[c].pending || []) { days.add(localDate(a)); days.add(localDate(b)); }
+  }
   st.days = [...days].sort();
   $("daySel").innerHTML = st.days.slice().reverse().map((d) =>
     `<option value="${d}">${new Date(d + "T12:00").toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })}</option>`).join("");
-  // start on a camera that has timelapses (usually the one you care about), else the first
-  st.cam = st.cams.find((c) => st.index.cameras[c].timelapse.length) || st.cams[0];
+  // start on a shown camera that has timelapses (usually the one you care about), else the first shown
+  const vis = visibleCams();
+  st.cam = vis.find((c) => st.index.cameras[c].timelapse.length) || vis[0] || st.cams[0];
+  buildCamPicker();
   buildRows();
+  fillEvCam();
   initExport();
   if (!st.days.length) { showOverlay("Nothing archived yet — hours appear here about 15–25 minutes after they end."); return; }
   await loadDay(st.days[st.days.length - 1]);

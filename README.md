@@ -136,6 +136,23 @@ that a newer example has, install prints a note and the defaults apply.
 **Timezone:** if `TZ` is set in the config, install adds a systemd drop-in so the nightly
 timelapse runs at 01:30 *in that zone*, even when the system clock is UTC.
 
+### Without systemd
+
+Nothing depends on systemd: the units only run three plain commands. Install with
+`--no-systemd` and schedule them however you like.
+
+| Command | When | Notes |
+|---|---|---|
+| `frigate-archive` | every 5 minutes | Locks itself (`LOCK_FILE`), so overlapping starts are harmless |
+| `frigate-archive-tool timelapse` | nightly, after midnight in `TZ` | Optional; only if `TIMELAPSE_CAMERAS` is set |
+| `frigate-archive-tool serve` | always running | Optional (page exports); a foreground process for any supervisor |
+
+`contrib/crontab` (installed as `$PREFIX/share/doc/frigate-archive/crontab.example`) is a
+ready `/etc/cron.d` file for the first two. For `serve`, use whatever supervises long-running
+processes on your system (OpenRC, runit, s6, supervisord, a container's init). It logs to
+stderr and exits cleanly on SIGTERM. Without journald, the scripts' output goes wherever
+your scheduler sends it; the cron example appends to `/var/log/frigate-archive.log`.
+
 ### Archive mount tips
 
 For NFS, use a **hard** mount with automount, e.g.:
@@ -226,8 +243,13 @@ The nicest way to run it is under Frigate's own URL, e.g. `https://frigate.examp
   - grey where footage exists;
   - blue bars for motion *above that camera's usual level* (cameras with constant background
     motion don't saturate);
-  - red and amber markers for alerts and detections.
+  - red and amber markers for alerts and detections;
+  - hatched where footage is already on the archive but its hour isn't joined yet (it becomes
+    playable about 15 minutes after the hour ends; exports already include it).
   - Click anywhere to play from that moment. A zoom strip shows ±30 minutes around the playhead.
+- **Cameras** picker: choose which cameras get a row, remembered per browser. Frigate's
+  camera groups appear as one-click presets, and a filter box appears with more than 12
+  cameras. Hidden cameras aren't loaded at all, and rows get more compact as the count grows.
 - **Player:**
   - continuous across hour boundaries, with the real date and time overlaid;
   - 1–16× speed, ±30 s / ±5 min, previous/next event;
@@ -252,8 +274,12 @@ The nicest way to run it is under Frigate's own URL, e.g. `https://frigate.examp
 hardware decoding, and in Safari. Firefox can't play it; use the download link. Timelapses
 are H.264 and play anywhere.
 
-The most recent hour or so isn't joined yet, so it doesn't show on the timeline. Exports
-still include it (from the raw segments), and Frigate's own UI has it.
+The most recent hour or so isn't joined yet: the timeline shows it hatched, but it can't play
+on the page. Exports include it (from the raw segments), and Frigate's own UI has it.
+
+**Loading:** a day costs one `day.json` per shown camera per UTC day (two per camera for most
+local days), not one file per hour. Enable gzip for JSON on the `/archive/data/` route (the
+nginx example does); it shrinks these about tenfold.
 
 ### Serving it at `<your Frigate URL>/archive/`
 
@@ -460,13 +486,14 @@ Dates and hours under `recordings/` and `hourly/` are **UTC**, matching Frigate'
 | `recordings/<date>/<HH>/<cam>/MM.SS.mp4` | Raw staging for recent hours |
 | `hourly/<cam>/<date>/<HH>.mp4` (`.p2.mp4`, ...) | Joined footage: faststart; HEVC tagged `hvc1` for browsers |
 | `hourly/<cam>/<date>/<HH>.json` | Sidecar (below) |
+| `hourly/<cam>/<date>/day.json` | That day's sidecars in one file, `{"hours": {"HH": sidecar}}`, for the page |
 | `hourly/<cam>/<date>/<HH>.failed` | A join that failed, with the error. Delete it to retry. |
 | `thumbs/<cam>/<review-id>.webp` | Review thumbnails |
 | `timelapse/<cam>/<local date>.mp4` / `.json` | Timelapse and its frame → wall-clock map |
 | `clips/` | `frigate-clip` output |
 | `exports/<id>/job.json`, `*.mp4` | Exports (page or `frigate-archive-tool export`), kept `EXPORT_KEEP_DAYS` |
 | `.meta/<cam>/<date>/<HH>.json` | Harvested Frigate metadata awaiting a join |
-| `index.json` | Cameras, available hours, timelapse days |
+| `index.json` | Per camera: joined hours, timelapse days, `pending` (staged, not joined) ranges; Frigate's camera `groups` |
 
 Sidecar format:
 
@@ -543,9 +570,10 @@ to `TIMELAPSE_CAMERAS` if you want timelapses.
 ## Limitations
 
 - **Single host.** It runs where Frigate's media directory is readable. Remote Frigate
-  instances aren't supported.
-- **Recent footage isn't on the page.** About the last hour is only in Frigate's UI (by
-  design: hours are joined when they're finished).
+  instances aren't supported yet; see [Roadmap](#roadmap).
+- **Recent footage doesn't play on the page.** About the last hour shows as hatched (on the
+  archive, not joined yet) and only plays in Frigate's UI. By design: hours are joined when
+  they're finished.
 - **ffmpeg HEVC crashes.** Some ffmpeg builds' HEVC decoders occasionally crash on certain
   camera streams. Joins work around it by dropping the offending segment, and timelapses by
   falling back to a full decode.
@@ -561,6 +589,61 @@ The page footer and `frigate-archive-tool --version` show the version. To releas
 and tag `vX.Y.Z`.
 
 ## Roadmap
+
+Ideas and TODOs. Nothing here is promised.
+
+### Run anywhere: split the roles
+
+Today everything runs on the Frigate host. The pipeline already has natural seams, and the
+aim is to let each piece run wherever suits you: a NAS, a separate review box, offsite.
+
+| Role | Needs | Today |
+|---|---|---|
+| **Collector** | Frigate's media dir and API | the staging step of `frigate-archive`, plus `harvest` |
+| **Transport** | anything that copies files | rsync to a mounted path |
+| **Processor** (join, index, timelapse) | the archive dir and ffmpeg | `consolidate` / `index` / `timelapse`, same host |
+| **Viewer** (page, export API) | the archive dir (writable, for exports) | static page and `serve`, behind Frigate's proxy |
+
+**The archive directory is the interface.** If whatever moves the files delivers this, a
+processor needs no access to Frigate at all:
+
+- `recordings/<utc-date>/<HH>/<cam>/MM.SS.mp4`: raw segments exactly as Frigate wrote them.
+  Deliver complete files only: write to a temporary name and rename, as rsync does.
+- `.meta/<cam>/<utc-date>/<HH>.json`: Frigate's metadata for the hour, as `harvest` writes it
+  today: `{"recordings": [{"start_time", "duration", "motion", "objects"}], "review": [Frigate
+  review items, as returned by /api/review]}`.
+- `thumbs/<cam>/<review-id>.webp`: review thumbnails.
+
+TODO:
+
+- [ ] **Processor without Frigate:** join from staged segments plus `.meta` only, when
+  `FRIGATE_API` / `FRIGATE_MEDIA` are unset. Mostly there already: consolidate falls back to
+  `.meta`, but the collector only writes it during `harvest`.
+- [ ] **Collector-only mode:** stage segments, metadata and thumbs, then stop, so the Frigate
+  host does no joining at all.
+- [ ] **Pluggable transport:** a hook (a command given the file list) so rsync over ssh,
+  rclone (S3, B2, …), Syncthing and so on can replace the mounted path. Everything that
+  crosses is plain files, so any copier works.
+- [ ] **Transport-independent settling:** don't rely on mtimes surviving the copy.
+- [ ] **Standalone viewer:** document auth when it isn't behind Frigate's login (basic auth,
+  oauth2-proxy, Authelia, Authentik), and make the *Frigate ↗* link configurable or hideable.
+- [ ] **Offsite copy:** replicate `hourly/`, `thumbs/`, `timelapse/` and `index.json` (already
+  joined, so each byte is written about once) to a second target with its own retention.
+- [ ] **Per-user access:** respect Frigate roles and camera permissions (needs a server side,
+  not just a static page).
+
+### Without systemd
+
+- [x] Plain commands; cron example (`contrib/crontab`)
+- [ ] OpenRC / runit / s6 service files for `serve`
+- [ ] `install.sh --cron` to install the cron file
+- [ ] Container image (sync, processor and `serve`)
+
+### Page
+
+- [ ] Screenshot/privacy mode: blur thumbnails and video, rename cameras to *camera 1…n*
+- [ ] Show footage that's local to Frigate but not on the archive yet
+- [ ] Commit hash in the version footer (`install.sh` stamping `git describe`)
 
 ## License
 

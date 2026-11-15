@@ -436,22 +436,81 @@ def cmd_filter(_args):
 
 # --- index / prune -----------------------------------------------------------
 
+def write_day(daydir):
+    """hourly/<cam>/<date>/day.json: all of that UTC day's sidecars in one file, so the page
+    fetches one file per camera per day instead of 24."""
+    hours = {}
+    for j in sorted(daydir.glob("[0-2][0-9].json")):
+        try:
+            hours[j.stem] = json.loads(j.read_text())
+        except (OSError, json.JSONDecodeError):
+            pass
+    out = daydir / "day.json"
+    if hours:
+        write_json(out, {"camera": daydir.parent.name, "date": daydir.name, "hours": hours})
+    else:
+        out.unlink(missing_ok=True)
+
+
+def pending_ranges():
+    """Raw segments already staged on the archive but not joined yet, per camera, as merged
+    [start, end] epoch ranges, so the page can show that the footage is there."""
+    starts = {}
+    for d in RAW.glob("[0-9]*-*-*/[0-2][0-9]/*") if RAW.is_dir() else []:
+        if not d.is_dir():
+            continue
+        ep = hour_epoch(d.parent.parent.name, d.parent.name)
+        for f in d.iterdir():
+            if re.fullmatch(r"\d\d\.\d\d\.mp4", f.name):
+                starts.setdefault(d.name, []).append(ep + int(f.name[:2]) * 60 + int(f.name[3:5]))
+    out = {}
+    for cam, ss in starts.items():
+        ranges = []
+        for s in sorted(ss):
+            if ranges and s <= ranges[-1][1] + 5:   # segments are ~10s; allow a little slack
+                ranges[-1][1] = max(ranges[-1][1], s + 10)
+            else:
+                ranges.append([s, s + 10])
+        out[cam] = ranges
+    return out
+
+
+def camera_groups(previous):
+    """Frigate's camera groups ({name: [cams]}, in Frigate's order), for the page's camera picker.
+    Keeps the last known groups if Frigate can't be reached."""
+    cfg = api("config")
+    if not cfg:
+        return previous
+    groups = sorted((cfg.get("camera_groups") or {}).items(), key=lambda kv: (kv[1].get("order", 0), kv[0]))
+    return {name: [c for c in g.get("cameras", []) if c in cfg.get("cameras", {})] for name, g in groups}
+
+
 def cmd_index(_args):
     cutoff = time.time() - KEEP_DAYS * 86400
     cams = {}
     for camdir in sorted(HOURLY.glob("*")) if HOURLY.is_dir() else []:
         hours = []
-        for j in sorted(camdir.glob("*/*.json")):
-            ep = hour_epoch(j.parent.name, j.stem)
-            if ep + 3600 < cutoff:
-                for f in j.parent.glob(f"{j.stem}.*"):
-                    f.unlink()
+        for daydir in sorted(camdir.glob("*")):
+            if not daydir.is_dir():
                 continue
-            hours.append(ep)
-        for d in camdir.glob("*"):
-            if d.is_dir() and not any(d.iterdir()):
-                d.rmdir()
+            pruned = False
+            for j in sorted(daydir.glob("[0-2][0-9].json")):
+                ep = hour_epoch(daydir.name, j.stem)
+                if ep + 3600 < cutoff:
+                    for f in daydir.glob(f"{j.stem}.*"):
+                        f.unlink()
+                    pruned = True
+                    continue
+                hours.append(ep)
+            day = daydir / "day.json"
+            newest = max((j.stat().st_mtime for j in daydir.glob("[0-2][0-9].json")), default=0)
+            if pruned or (newest and (not day.exists() or day.stat().st_mtime < newest)):
+                write_day(daydir)
+            if not any(daydir.iterdir()):
+                daydir.rmdir()
         cams.setdefault(camdir.name, {})["hours"] = hours
+    for cam, ranges in pending_ranges().items():
+        cams.setdefault(cam, {})["pending"] = ranges
     today = dt.date.today()
     for camdir in sorted(TIMELAPSE.glob("*")) if TIMELAPSE.is_dir() else []:
         days = []
@@ -472,9 +531,14 @@ def cmd_index(_args):
     for c in cams.values():
         c.setdefault("hours", [])
         c.setdefault("timelapse", [])
+        c.setdefault("pending", [])
     prune_exports()
+    try:
+        previous = json.loads((ARCHIVE / "index.json").read_text()).get("groups", {})
+    except (OSError, json.JSONDecodeError):
+        previous = {}
     write_json(ARCHIVE / "index.json", {"generated": int(time.time()), "keep_days": KEEP_DAYS,
-                                        "cameras": cams})
+                                        "cameras": cams, "groups": camera_groups(previous)})
 
 
 # --- timelapse ---------------------------------------------------------------
