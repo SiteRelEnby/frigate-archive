@@ -3,13 +3,40 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<meta name="darkreader-lock">
 <title>Frigate Archive</title>
+<script>
+  // theme before first paint: "dark" | "light" | system (no attribute)
+  try { const t = localStorage.getItem("fa-theme"); if (t === "dark" || t === "light") document.documentElement.dataset.theme = t; } catch (e) {}
+</script>
 <style>
+  /* dark is the default; light via the theme toggle or the OS setting (System) */
   :root {
-    --bg: #0f1216; --panel: #171b21; --panel2: #1e232b; --line: #2a313b;
-    --text: #e6e9ee; --dim: #8b95a3; --accent: #5aa2ff;
+    color-scheme: dark;
+    --bg: #0f1216; --panel: #171b21; --panel2: #1e232b; --line: #2a313b; --hover: #3b4552;
+    --text: #e6e9ee; --dim: #8b95a3; --accent: #5aa2ff; --on-accent: #06111f;
     --motion: #3d7fd9; --footage: #232a33; --gap: #12161b;
     --alert: #ff5d5d; --detect: #f2b441; --head: #ffffff;
+    --track: #2b333e; --track-line: #3d4756; --tip: #000;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      color-scheme: light;
+      --bg: #f3f5f8; --panel: #ffffff; --panel2: #eef1f5; --line: #d6dce4; --hover: #aeb8c5;
+      --text: #1a1f27; --dim: #5d6876; --accent: #1f6fd6; --on-accent: #ffffff;
+      --motion: #3b7fe0; --footage: #d9dfe7; --gap: #f1f3f6;
+      --alert: #d93636; --detect: #d48a00; --head: #111111;
+      --track: #e3e8ee; --track-line: #b9c3cf; --tip: #ffffff;
+    }
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #f3f5f8; --panel: #ffffff; --panel2: #eef1f5; --line: #d6dce4; --hover: #aeb8c5;
+    --text: #1a1f27; --dim: #5d6876; --accent: #1f6fd6; --on-accent: #ffffff;
+    --motion: #3b7fe0; --footage: #d9dfe7; --gap: #f1f3f6;
+    --alert: #d93636; --detect: #d48a00; --head: #111111;
+    --track: #e3e8ee; --track-line: #b9c3cf; --tip: #ffffff;
   }
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }   /* class display rules (.overlay grid, .btn) would otherwise beat it */
@@ -24,9 +51,9 @@
   .datenav { display: flex; align-items: center; gap: 4px; }
   .btn { background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
     padding: 5px 10px; cursor: pointer; white-space: nowrap; }
-  .btn:hover { border-color: #3b4552; }
+  .btn:hover { border-color: var(--hover); }
   .btn:disabled { opacity: .4; cursor: default; }
-  .btn.on { background: var(--accent); border-color: var(--accent); color: #06111f; }
+  .btn.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
   select.btn { padding-right: 6px; }
   .spacer { flex: 1; }
   a { color: var(--accent); text-decoration: none; }
@@ -81,7 +108,7 @@
   .xrow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 10px; }
   .xrow label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
   .xrow .k { color: var(--dim); font-size: 12px; min-width: 64px; }
-  input[type=datetime-local] { background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; color-scheme: dark; }
+  input[type=datetime-local] { background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; }
   .xnote { color: var(--dim); font-size: 12px; }
   .xerr { color: var(--alert); font-size: 12px; }
   .jobs { border-top: 1px solid var(--line); margin-top: 4px; max-height: 360px; overflow-y: auto; }
@@ -90,9 +117,11 @@
   .job .what { font-variant-numeric: tabular-nums; }
   .job .meta { color: var(--dim); font-size: 12px; }
   .job .files { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 13px; }
-  .bar { height: 6px; background: var(--gap); border-radius: 3px; overflow: hidden; margin-top: 4px; max-width: 420px; }
-  .bar i { display: block; height: 100%; background: var(--accent); }
-  .tip { position: fixed; pointer-events: none; background: #000; border: 1px solid var(--line); border-radius: 6px;
+  .prog { display: flex; align-items: center; gap: 10px; margin-top: 5px; max-width: 720px; }
+  .bar { flex: 1; height: 12px; background: var(--track); border: 1px solid var(--track-line); border-radius: 7px; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--accent); border-radius: 6px 0 0 6px; transition: width .5s; }
+  .prog b { font-variant-numeric: tabular-nums; min-width: 3.2em; text-align: right; }
+  .tip { position: fixed; pointer-events: none; background: var(--tip); border: 1px solid var(--line); border-radius: 6px;
     padding: 4px 8px; font-size: 12px; white-space: nowrap; z-index: 10; font-variant-numeric: tabular-nums; }
 </style>
 </head>
@@ -111,6 +140,11 @@
     </div>
     <div class="spacer"></div>
     <button class="btn" id="exportBtn" hidden title="Export a time range as video files (shift-drag on the timeline to select)">Export…</button>
+    <div class="seg" id="themeSeg" title="Theme">
+      <button class="btn" data-theme-set="system">System</button>
+      <button class="btn" data-theme-set="light">Light</button>
+      <button class="btn" data-theme-set="dark">Dark</button>
+    </div>
     <a href="../" class="btn" title="Back to Frigate (assumes this page is served under Frigate's host, e.g. /archive/)">Frigate ↗</a>
   </header>
 
@@ -148,10 +182,11 @@
       <span class="k">format</span>
       <div class="seg" id="xEnc">
         <button class="btn on" data-enc="copy" title="Exact copy of the recording: fast, original quality and size">Original</button>
-        <button class="btn" data-enc="x265" title="Re-encode to H.265 with x265: slow (several minutes per hour of footage), smaller, always one file per camera">H.265 (smaller)</button>
+        <button class="btn" data-enc="vaapi" hidden title="Re-encode to H.265 on the GPU (VAAPI): fast (~13× realtime), smaller, always one file per camera">H.265 GPU</button>
+        <button class="btn" data-enc="x265" title="Re-encode to H.265 with x265 on the CPU: slow (~4× realtime at 1440p), slightly better quality per MB than the GPU, always one file per camera">H.265 CPU</button>
       </div>
       <span id="xEncOpts" hidden>
-        <select class="btn" id="xCrf" title="x265 CRF: lower = better quality, bigger file">
+        <select class="btn" id="xCrf" title="x265 CRF / GPU ICQ: lower = better quality, bigger file">
           <option value="28">quality: high</option><option value="30" selected>quality: balanced</option><option value="32">quality: small</option>
         </select>
         <select class="btn" id="xHeight" title="Scale down (never up)">
@@ -604,16 +639,17 @@ const xCams = () => [...document.querySelectorAll("#xCams input:checked")].map((
 function updateExportInfo() {
   const len = st.sel ? st.sel.b - st.sel.a : 0, cams = xCams(), enc = xEnc();
   $("xLen").textContent = st.sel ? fmtDur(len) : "";
-  $("xEncOpts").hidden = enc !== "x265";
+  $("xEncOpts").hidden = enc === "copy";
   let err = "";
   if (!st.sel) err = "pick a range: shift-drag on the timeline, or set from/to";
   else if (len > xp.maxHours * 3600) err = `max ${xp.maxHours} hours per export`;
   else if (!cams.length) err = "pick at least one camera";
   $("xErr").textContent = err;
   $("xGo").disabled = !!err;
-  if (enc === "x265" && st.sel) {
-    // rough: this CPU does ~4x realtime at 1440p, faster when scaling down
-    const h = +$("xHeight").value || 1440, speed = h >= 1440 ? 4 : h >= 1080 ? 6 : h >= 720 ? 10 : 16;
+  if (enc !== "copy" && st.sel) {
+    // rough: x265 does ~4x realtime at 1440p (faster when scaling down); the GPU ~13x
+    const h = +$("xHeight").value || 1440;
+    const speed = enc === "vaapi" ? 13 : h >= 1440 ? 4 : h >= 1080 ? 6 : h >= 720 ? 10 : 16;
     $("xEst").textContent = `≈ ${fmtDur(Math.max(60, (len * cams.length) / speed))} to encode`;
   } else $("xEst").textContent = enc === "copy" ? "fast; a camera that changed codec/resolution mid-range gives extra parts" : "";
 }
@@ -643,6 +679,8 @@ async function refreshJobs() {
   try {
     const d = await api("exports");
     xp.jobs = d.jobs; xp.maxHours = d.max_hours; xp.keepDays = d.keep_days;
+    const gpu = (d.encoders || []).includes("vaapi"), gb = document.querySelector('#xEnc [data-enc="vaapi"]');
+    if (gb.hidden === gpu) { gb.hidden = !gpu; if (!gpu && gb.classList.contains("on")) document.querySelector('#xEnc [data-enc="copy"]').click(); }
     $("xKeep").textContent = `exports are kept ${xp.keepDays} days`;
   } catch (e) { $("xJobs").innerHTML = `<div class="xerr" style="padding:8px 0">export service unreachable: ${esc(e.message)}</div>`; }
   renderJobs();
@@ -651,21 +689,29 @@ async function refreshJobs() {
   $("exportBtn").textContent = active ? `Export… (${xp.jobs.filter((j) => j.state === "running" || j.state === "queued").length})` : "Export…";
 }
 
+function eta(j) {
+  // time left from the rate so far (needs a few % to settle)
+  if (!j.started || j.progress < 0.02) return "";
+  const el = Date.now() / 1000 - j.started, left = el / j.progress - el;
+  return `<span class="xnote">~${fmtDur(Math.max(60, Math.round(left / 60) * 60))} left</span>`;
+}
+
 function renderJobs() {
   const el = $("xJobs");
   if (!xp.jobs.length) { el.innerHTML = `<div class="xnote" style="padding:8px 0">No exports yet.</div>`; return; }
   el.innerHTML = xp.jobs.map((j) => {
-    const fmt = j.encode === "x265" ? `H.265 CRF ${j.crf}${j.height ? ` ${j.height}p` : ""}` : "original";
+    const fmt = j.encode === "copy" ? "original"
+      : `H.265 ${j.encode === "vaapi" ? "GPU" : "CPU"} q${j.crf}${j.height ? ` ${j.height}p` : ""}`;
     const range = `${localDate(j.start)} ${hms(j.start)} → ${localDate(j.end) === localDate(j.start) ? "" : localDate(j.end) + " "}${hms(j.end)}`;
     const active = j.state === "queued" || j.state === "running";
     let status = esc(j.state);
-    if (j.state === "running") status = `${Math.round(j.progress * 100)}% · ${esc(j.message || "")}`;
+    if (j.state === "running") status = esc(j.message || "running");
     const files = j.files.map((f) => `<a href="${DATA}exports/${encodeURIComponent(j.id)}/${encodeURIComponent(f.file)}" download>⤓ ${esc(f.file)}</a>
       <span class="xnote">${fmtSize(f.size)} · ${fmtDur(f.duration)}</span>`).join("");
-    const msg = j.state !== "running" && j.message ? `<div class="${j.state === "failed" ? "xerr" : "xnote"}">${esc(j.message)}</div>` : "";
+    const msg = j.state !== "running" && j.message && j.message !== j.state ? `<div class="${j.state === "failed" ? "xerr" : "xnote"}">${esc(j.message)}</div>` : "";
     return `<div class="job">
       <div><div class="what">${esc(j.cameras.join(", "))} · ${range} <span class="meta">(${fmtDur(j.end - j.start)}, ${fmt})</span></div>
-        <div class="meta">${status}</div>${j.state === "running" ? `<div class="bar"><i style="width:${(j.progress * 100).toFixed(1)}%"></i></div>` : ""}${msg}</div>
+        <div class="meta">${status}</div>${j.state === "running" ? `<div class="prog"><div class="bar"><i style="width:${(j.progress * 100).toFixed(1)}%"></i></div><b>${Math.floor(j.progress * 100)}%</b>${eta(j)}</div>` : ""}${msg}</div>
       <div><button class="btn" data-job="${esc(j.id)}" data-act="${active ? "cancel" : "delete"}">${active ? "Cancel" : "Delete"}</button></div>
       ${files ? `<div class="files">${files}</div>` : ""}</div>`;
   }).join("");
@@ -742,7 +788,18 @@ function skip(sec) {
   else playAt(st.cur.cam, st.wall + sec, !vid.paused);
 }
 
+function setTheme(t) {
+  if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+  else delete document.documentElement.dataset.theme;
+  try { t === "light" || t === "dark" ? localStorage.setItem("fa-theme", t) : localStorage.removeItem("fa-theme"); } catch (e) {}
+  document.querySelectorAll("#themeSeg .btn").forEach((b) => b.classList.toggle("on", b.dataset.themeSet === (document.documentElement.dataset.theme || "system")));
+  if (st.day) renderAll();                 // canvases read the palette when drawn
+}
+
 function wire() {
+  document.querySelectorAll("#themeSeg .btn").forEach((b) => (b.onclick = () => setTheme(b.dataset.themeSet)));
+  setTheme(document.documentElement.dataset.theme || "system");
+  matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => { if (st.day) renderAll(); });
   $("prevDay").onclick = () => { const i = st.days.indexOf(st.day); if (i > 0) loadDay(st.days[i - 1]); };
   $("nextDay").onclick = () => { const i = st.days.indexOf(st.day); if (i < st.days.length - 1) loadDay(st.days[i + 1]); };
   $("daySel").onchange = (e) => loadDay(e.target.value);

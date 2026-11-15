@@ -14,7 +14,7 @@ Nightly (frigate-timelapse.timer):
 Manual:
   clip <camera> <start> <duration> [out]   e.g.  clip garden "2026-10-21 14:00" 45m
                                            (also installed as `frigate-clip`)
-  export --cams a,b --start T (--end T | --duration D) [--x265 [--crf N] [--height H]]
+  export --cams a,b --start T (--end T | --duration D) [--x265|--gpu [--crf N] [--height H]]
                  one file per camera into exports/<id>/ (also what the page's Export runs)
   serve          export API for the review page (frigate-archive-export.service)
   harvest        save Frigate metadata for not-yet-joined hours (run before cutting
@@ -81,6 +81,7 @@ DEFAULTS = {
     "EXPORT_KEEP_DAYS": "7",
     "EXPORT_MAX_HOURS": "24",
     "EXPORT_THREADS": "",
+    "EXPORT_VAAPI_DEVICE": "/dev/dri/renderD128",
 }
 CONF_PATH = os.environ.get("FRIGATE_ARCHIVE_CONF", "/etc/frigate-archive/frigate-archive.conf")
 
@@ -625,6 +626,25 @@ CRFS = range(18, 41)
 HEIGHTS = (480, 720, 1080, 1440)
 
 
+_vaapi = None
+
+
+def vaapi_ok():
+    """Can this host encode HEVC with VAAPI? (needs the GPU's VA driver on the host, e.g. intel-media-va-driver)"""
+    global _vaapi
+    if _vaapi is None:
+        dev = CONF["EXPORT_VAAPI_DEVICE"]
+        _vaapi = bool(dev) and os.path.exists(dev) and subprocess.run(
+            ["ffmpeg", "-v", "error", "-nostdin", "-vaapi_device", dev, "-f", "lavfi", "-i", "testsrc=size=320x240:d=0.2",
+             "-vf", "format=nv12,hwupload", "-c:v", "hevc_vaapi", "-f", "null", "-"],
+            capture_output=True, timeout=30).returncode == 0
+    return _vaapi
+
+
+def encoders():
+    return ["copy", "x265"] + (["vaapi"] if vaapi_ok() else [])
+
+
 def known_cameras():
     cams = {d.name for d in HOURLY.glob("*") if d.is_dir()} if HOURLY.is_dir() else set()
     for root in (SRC, RAW):
@@ -771,23 +791,45 @@ def run_export(job):
             w = round(tallest[1] * h / tallest[2] / 2) * 2
             audio = any(g[0][4][3] for g in groups)
             pools = CONF["EXPORT_THREADS"]
+            gpu, dev = enc == "vaapi", CONF["EXPORT_VAAPI_DEVICE"]
+            if gpu:
+                # ICQ quality is on roughly the same scale as x265's CRF (similar sizes at the same number)
+                venc = ["-c:v", "hevc_vaapi", "-rc_mode", "ICQ", "-global_quality", str(job["crf"])]
+            else:
+                venc = ["-c:v", "libx265", "-preset", "medium", "-crf", str(job["crf"]),
+                        "-x265-params", "log-level=error" + (f":pools={pools}" if pools else "")]
+            fit = (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                   f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,")
             chunks = []
             for k, g in enumerate(groups):
                 chunk = outdir / f".{base}.c{k}.mp4"
-                silent = audio and not g[0][4][3]
-                ffmpeg_progress([
-                    *concat_input(g),
-                    *(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono"] if silent else []),
-                    "-map", "0:v", *(["-map", "1:a" if silent else "0:a"] if audio else []),
-                    "-vf", f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
-                           f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p",
-                    "-c:v", "libx265", "-preset", "medium", "-crf", str(job["crf"]),
-                    "-x265-params", "log-level=error" + (f":pools={pools}" if pools else ""),
-                    "-tag:v", "hvc1",
-                    *(["-c:a", "aac", "-b:a", "64k", "-ar", "48000", "-ac", "1"] if audio else []),
-                    *(["-shortest"] if silent else []),
-                    "-f", "mp4", str(chunk)],
-                    progress)
+                sig = g[0][4]
+                silent = audio and not sig[3]
+                tries = []                              # (label, pre-input args, video filter)
+                if gpu and abs(sig[1] / sig[2] - w / h) < 0.01:
+                    # all on the GPU: decode, scale, encode (no letterboxing needed at the same aspect)
+                    tries.append(("gpu", ["-hwaccel", "vaapi", "-hwaccel_device", dev, "-hwaccel_output_format", "vaapi"],
+                                  f"scale_vaapi=w={w}:h={h}:format=nv12"))
+                if gpu:                                 # CPU decode/scale, GPU encode
+                    tries.append(("gpu-enc", ["-vaapi_device", dev], fit + "format=nv12,hwupload"))
+                else:
+                    tries.append(("cpu", [], fit + "format=yuv420p"))
+                for n, (label, pre, vf) in enumerate(tries):
+                    try:
+                        ffmpeg_progress([
+                            *pre, *concat_input(g),
+                            *(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono"] if silent else []),
+                            "-map", "0:v", *(["-map", "1:a" if silent else "0:a"] if audio else []),
+                            "-vf", vf, *venc, "-tag:v", "hvc1",
+                            *(["-c:a", "aac", "-b:a", "64k", "-ar", "48000", "-ac", "1"] if audio else []),
+                            *(["-shortest"] if silent else []),
+                            "-f", "mp4", str(chunk)],
+                            progress)
+                        break
+                    except RuntimeError as ex:
+                        if n == len(tries) - 1:
+                            raise
+                        log(f"  {cam} run {k + 1}: {label} pipeline failed ({ex}); retrying with {tries[n + 1][0]}")
                 chunks.append(chunk)
                 done += group_len(g)
             name = f"{base}.mp4"
@@ -835,7 +877,10 @@ def cmd_export(args):
         s = parse_when(args.start)
         e = parse_when(args.end) if args.end else s + parse_dur(args.duration)
         cams = [c for c in re.split(r"[\s,]+", args.cams) if c]
-        job = new_job(cams, s, e, "x265" if args.x265 else "copy", args.crf, args.height, state="running")
+        if args.gpu and not vaapi_ok():
+            sys.exit(f"--gpu: VAAPI HEVC encoding doesn't work on {CONF['EXPORT_VAAPI_DEVICE'] or '(no device set)'}")
+        enc = "vaapi" if args.gpu else "x265" if args.x265 else "copy"
+        job = new_job(cams, s, e, enc, args.crf, args.height, state="running")
     for f in (EXPORTS / job["id"]).glob(".*"):        # leftovers of an interrupted attempt
         f.unlink()
     job.update(state="running", progress=0, files=[], message="", pid=os.getpid(), started=int(time.time()))
@@ -959,7 +1004,7 @@ def cmd_serve(_args):
 
         def do_GET(self):
             if self.parts() == ["exports"]:
-                return self.send(200, {"jobs": list_jobs(), "max_hours": max_sec / 3600,
+                return self.send(200, {"jobs": list_jobs(), "max_hours": max_sec / 3600, "encoders": encoders(),
                                        "keep_days": float(CONF["EXPORT_KEEP_DAYS"])})
             self.send(404, {"error": "not found"})
 
@@ -991,7 +1036,7 @@ def cmd_serve(_args):
                     raise ValueError("unknown camera")
                 if not 0 < e - s <= max_sec:
                     raise ValueError(f"range must be between 1 second and {max_sec / 3600:g} hours")
-                if enc not in ("copy", "x265") or crf not in CRFS or (height and height not in HEIGHTS):
+                if enc not in encoders() or crf not in CRFS or (height and height not in HEIGHTS):
                     raise ValueError("bad encoding options")
             except (KeyError, TypeError, ValueError) as ex:
                 return self.send(400, {"error": str(ex)})
@@ -1016,7 +1061,7 @@ def cmd_serve(_args):
     def stop(_sig, _frm):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, stop)
-    log(f"export API on {CONF['EXPORT_LISTEN']}, jobs in {EXPORTS}")
+    log(f"export API on {CONF['EXPORT_LISTEN']}, jobs in {EXPORTS}, encoders: {', '.join(encoders())}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -1060,6 +1105,9 @@ def cmd_check(_args):
             print(f"       Frigate local continuous retention: {days} days "
                   f"(archive keeps {KEEP_DAYS:g}; raw staging covers the last "
                   f"{CONF['RAW_WINDOW_MIN']} min)")
+    if CONF["EXPORT_VAAPI_DEVICE"]:
+        print(f"       GPU (VAAPI) H.265 exports: {'available' if vaapi_ok() else 'not available'} "
+              f"on {CONF['EXPORT_VAAPI_DEVICE']}")
     print(f"timezone for local days: {CONF['TZ'] or time.tzname[0] + ' (system)'}")
     return 0 if ok else 1
 
@@ -1087,8 +1135,9 @@ def main():
     x.add_argument("--end")
     x.add_argument("--duration", help="instead of --end: 45m, 1h30m, ...")
     x.add_argument("--x265", action="store_true", help="re-encode to H.265 (slow; smaller, one file per camera)")
-    x.add_argument("--crf", type=int, default=30, choices=CRFS, metavar="18-40")
-    x.add_argument("--height", type=int, choices=HEIGHTS, help="scale down to this height (with --x265)")
+    x.add_argument("--gpu", action="store_true", help="re-encode to H.265 on the GPU (VAAPI): fast, one file per camera")
+    x.add_argument("--crf", type=int, default=30, choices=CRFS, metavar="18-40", help="quality (x265 CRF / VAAPI ICQ)")
+    x.add_argument("--height", type=int, choices=HEIGHTS, help="scale down to this height (with --x265/--gpu)")
     sub.add_parser("serve")
     a = p.parse_args()
     if a.cmd not in ("filter", "check") and not MARKER.exists():

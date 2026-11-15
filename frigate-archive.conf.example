@@ -69,6 +69,11 @@ EXPORT_MAX_HOURS=24
 # low priority); set e.g. 8 to leave headroom for Frigate.
 EXPORT_THREADS=""
 
+# GPU (VAAPI) device for the "H.265 GPU" export option. Used only if a test encode works at
+# startup, which needs the GPU's VA driver on the host (Intel: intel-media-va-driver /
+# -non-free; check with `vainfo`). Empty = never use the GPU.
+EXPORT_VAAPI_DEVICE=/dev/dri/renderD128
+
 # --- Status / alerting -------------------------------------------------------
 
 # Status JSON written every run. Alert when last_success is older than about an hour.

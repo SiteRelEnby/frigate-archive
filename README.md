@@ -1,7 +1,6 @@
 # frigate-archive
 
-Keep [Frigate](https://frigate.video) NVR recordings somewhere bigger than the Frigate box, and
-make them easy to review.
+An archive for recordings from [Frigate](https://frigate.video) NVR recordings, for long-term off-server archiving to save on disk space, while still keeping recordings easily reviewable and exportable.
 
 Frigate stores recordings on its own disk, and continuous recording from a few cameras fills
 a small disk in days. frigate-archive lets you keep only a short window locally (say 12 hours)
@@ -177,6 +176,7 @@ variables with the same names override it, which is handy for testing. Point
 | `EXPORT_KEEP_DAYS` | `7` | Delete finished exports after this many days |
 | `EXPORT_MAX_HOURS` | `24` | Longest range one export may cover |
 | `EXPORT_THREADS` | *(auto)* | x265 thread pool size (`pools=`); set it to leave cores for Frigate |
+| `EXPORT_VAAPI_DEVICE` | `/dev/dri/renderD128` | GPU for the *H.265 GPU* option (needs the VA driver on the host; empty = off) |
 | `LOCK_FILE`, `TMP_DIR` | `/run/frigate-archive.lock`, `/var/tmp/frigate-archive` | Internals |
 
 `frigate-archive.conf.example` documents each setting in place.
@@ -273,10 +273,15 @@ The page's **Export…** button opens a panel:
    - **Original:** stream copy. Fast (mostly NAS speed), exact quality, same size as the
      recording. If a camera changed codec or resolution inside the range, that camera gets
      extra `….p2.mp4` parts, since a stream copy can't splice them.
-   - **H.265 (smaller):** re-encoded with x265 (`preset medium`). Always one file per camera:
-     every run is scaled/padded to one size and audio is normalized (silence added where a
-     run had none). Quality *high / balanced / small* = CRF 28 / 30 / 32; optional downscale
-     to 1440p–480p.
+   - **H.265 GPU / H.265 CPU:** re-encoded, always one file per camera: every run is
+     scaled/padded to one size and audio is normalized (silence added where a run had none).
+     Quality *high / balanced / small* = 28 / 30 / 32 (x265 CRF, or VAAPI ICQ for the GPU,
+     which land at similar sizes); optional downscale to 1440p–480p.
+     - **GPU** (VAAPI `hevc_vaapi`): decode, scale and encode on the GPU, ~13× realtime. Only
+       offered when a test encode works (see `EXPORT_VAAPI_DEVICE`). If GPU decoding fails on
+       a stream it retries with CPU decoding and GPU encoding.
+     - **CPU** (x265 `preset medium`): ~4× realtime at 1440p, slightly better quality for the
+       same size.
 4. Jobs run **one at a time** in the background with progress, cancel and delete. Finished
    files are in `ARCHIVE/exports/<id>/` and are deleted after `EXPORT_KEEP_DAYS`.
 
@@ -287,18 +292,24 @@ camera recorded nothing are skipped, not padded.
 **What to expect from H.265:** these are re-encodes of footage the camera already compressed,
 so savings depend on what you trade. One sample (2304×1296 H.264 at ~1.2 Mbit/s, 15 fps):
 
-| Setting | Size vs original | Encode speed (18 cores) |
-|---|---|---|
-| CRF 30 | −16% | ~4× realtime |
-| CRF 32 | −37% | ~4× realtime |
-| CRF 30, 1080p | −49% | ~5× realtime |
-| CRF 28, 720p | −75% | ~10× realtime |
+| Setting | Size vs original | SSIM | Speed (x265 on 18 cores / Intel iGPU) |
+|---|---|---|---|
+| CPU CRF 30 | −16% | 0.982 | ~4× realtime |
+| CPU CRF 32 | −37% | 0.977 | ~4× |
+| GPU ICQ 30 | −19% | 0.981 | ~13× |
+| GPU ICQ 32 | −41% | 0.973 | ~13× |
+| CPU CRF 30, 1080p | −49% | 0.981 | ~5× |
+| GPU ICQ 30, 1080p | −48% | 0.976 | ~13× |
+| CPU CRF 28, 720p | −75% | | ~10× |
 
-At ~4× realtime, an hour of one 1440p camera takes about 15 minutes. Cameras that already
-record in HEVC gain less. The service runs at `Nice=15` / `CPUWeight=20` so Frigate wins
-when they compete; `EXPORT_THREADS` caps it further. (Hardware encoding isn't used: VAAPI
-generally isn't available on the host when only the Frigate container has the GPU driver.
-SVT-AV1 was tried and produced *larger* files on this kind of footage.)
+How much a given setting saves varies a lot with the scene (night noise, foliage, a busy
+street), so treat these as a rough guide. Cameras that already record in HEVC gain less.
+With x265, an hour of one 1440p camera takes about 15 minutes; on the GPU, about 5.
+
+The service runs at `Nice=15` / `CPUWeight=20` so Frigate wins when they compete;
+`EXPORT_THREADS` caps x265 further. The GPU option shares the iGPU with Frigate's decoding
+and detection; watch Frigate's GPU stats during long GPU exports. (SVT-AV1 was tried and produced *larger*
+files on this kind of footage, so it isn't offered.)
 
 ### Export API
 
@@ -309,8 +320,8 @@ behind the same `auth_request` as the page (the `/archive/api/` block in
 
 | Request | Does |
 |---|---|
-| `GET /exports` | List jobs (newest first), plus `max_hours` and `keep_days` |
-| `POST /exports` | `{"cameras":[…], "start":epoch, "end":epoch, "encode":"copy"\|"x265", "crf":18–40, "height":null\|480…1440}` → queued job |
+| `GET /exports` | List jobs (newest first), plus `max_hours`, `keep_days` and the available `encoders` |
+| `POST /exports` | `{"cameras":[…], "start":epoch, "end":epoch, "encode":"copy"\|"x265"\|"vaapi", "crf":18–40, "height":null\|480…1440}` → queued job |
 | `POST /exports/<id>/cancel` | Cancel a queued or running job |
 | `DELETE /exports/<id>` | Cancel if needed, then delete the job and its files |
 
@@ -328,7 +339,7 @@ frigate-archive-tool index              rebuild index.json, prune past KEEP_DAYS
 frigate-archive-tool harvest            save Frigate metadata for not-yet-joined hours
 frigate-archive-tool timelapse [YYYY-MM-DD] [--cams a,b]   default: yesterday, TIMELAPSE_CAMERAS
 
-frigate-archive-tool export --cams a,b --start T (--end T | --duration D) [--x265 [--crf N] [--height H]]
+frigate-archive-tool export --cams a,b --start T (--end T | --duration D) [--x265|--gpu [--crf N] [--height H]]
     one file per camera into ARCHIVE/exports/<id>/ (shows up in the page's job list too);
     T is local "YYYY-MM-DD HH:MM[:SS]", "HH:MM" for today, or @epoch (unambiguous across DST)
 frigate-archive-tool serve              the export API (normally frigate-archive-export.service)
